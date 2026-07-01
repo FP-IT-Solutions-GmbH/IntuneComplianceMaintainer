@@ -64,6 +64,9 @@ $WindowsAllowNewerBuilds      = $false                # if true, highestVersion 
 $WindowsComplianceMode        = "Ranges"              # Ranges | MinimumVersion; use Ranges if multiple WindowsBuildNumbers defined
 $WindowsAppProtectionTarget   = "Lowest"              # Lowest | Highest; which build to target for Windows App Protection
 
+# Android-specific settings
+$AndroidMinimumVersion        = ""                    # enforce a specific minimum Android version e.g. "16" for Android 16+. Leave blank to use the oldest currently maintained version
+
 # --------------------------- Safety ---------------------------
 # Allow lowering existing minimum (if set)? Default false
 $AllowDowngrade        = $false
@@ -274,7 +277,7 @@ function Get-LatestOsVersion {
 }
 
 function Get-AndroidVersionData {
-  param([int]$CadenceDays)
+  param([int]$CadenceDays,[string]$MinVersionOverride)
   # Fetch all Android releases and filter to maintained (non-EOL) ones only.
   $url = "https://endoflife.date/api/v1/products/android/"
   $res = Invoke-RestMethod -Uri $url -Method Get
@@ -284,7 +287,18 @@ function Get-AndroidVersionData {
   }
   # Sort numerically so the oldest maintained version can be selected reliably.
   $sorted = $maintained | Sort-Object { [System.Version]"$($_.name).0" }
-  $oldest = $sorted | Select-Object -First 1
+  if ($MinVersionOverride) {
+    # Validate the override against the live maintained list so a version that has
+    # since gone EOL is caught immediately rather than silently applied.
+    $overrideRelease = $maintained | Where-Object { $_.name -eq $MinVersionOverride }
+    if (-not $overrideRelease) {
+      $maintainedNames = ($sorted | ForEach-Object { $_.name }) -join ', '
+      throw "AndroidMinimumVersion '$MinVersionOverride' is not a currently maintained Android release. Maintained versions: $maintainedNames"
+    }
+    $oldest = $overrideRelease
+  } else {
+    $oldest = $sorted | Select-Object -First 1
+  }
   # Android releases a security patch on the 1st of every month. Use the 1st of
   # the current month as the patch release date and apply cadence from there,
   # consistent with how all other platform releases are treated.
@@ -558,7 +572,7 @@ foreach ($platform in $EolProducts.Keys) {
   if ($platform -eq "Windows" -and $hasCompliance) {
     $notEffectiveCompliance = $winData.EffectiveDate -and ($now -lt $winData.EffectiveDate)
   } elseif ($platform -eq "Android") {
-    $latest = Get-AndroidVersionData -CadenceDays $CadenceDays
+    $latest = Get-AndroidVersionData -CadenceDays $CadenceDays -MinVersionOverride $AndroidMinimumVersion
     $notEffectiveCompliance = $now -lt $latest.EffectiveDate
   } else {
     $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
@@ -569,7 +583,7 @@ foreach ($platform in $EolProducts.Keys) {
     if ($platform -eq "Windows") {
       $notEffectiveApp = $winData.EffectiveDate -and ($now -lt $winData.EffectiveDate)
     } elseif ($platform -eq "Android") {
-      $appLatest = if ($latest) { $latest } else { Get-AndroidVersionData -CadenceDays $CadenceDays }
+      $appLatest = if ($latest) { $latest } else { Get-AndroidVersionData -CadenceDays $CadenceDays -MinVersionOverride $AndroidMinimumVersion }
       $notEffectiveApp = $now -lt $appLatest.EffectiveDate
     } else {
       $appLatest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays

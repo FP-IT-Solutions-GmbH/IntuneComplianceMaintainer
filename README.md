@@ -115,6 +115,16 @@ $WindowsComplianceMode = "Ranges"
 $WindowsAppProtectionTarget = "Lowest"
 ```
 
+### Android-Specific Settings
+
+```powershell
+# Optional: enforce a specific minimum Android version instead of the oldest maintained
+# e.g. "16" requires Android 16+ on all targeted policies
+# Leave blank to use the oldest currently maintained version automatically
+# Must be a currently maintained release — the script throws if the value has gone EOL
+$AndroidMinimumVersion = ""
+```
+
 ### Safety Settings
 
 ```powershell
@@ -176,7 +186,7 @@ Deploy to Azure Automation for scheduled runs:
 ### For Android
 
 1. Queries endoflife.date API to determine all currently maintained Android versions (e.g. 14, 15, 16, 17)
-2. Sets `osMinimumVersion` / `minimumRequiredOsVersion` to the **oldest** maintained version — devices running any supported Android release satisfy the version check
+2. Sets `osMinimumVersion` / `minimumRequiredOsVersion` to the **oldest** maintained version by default — devices running any supported Android release satisfy the version check. Set `$AndroidMinimumVersion` to enforce a higher floor (e.g. `"16"` for Android 16+)
 3. Derives the monthly security patch date from Android's fixed release schedule (1st of each month) and applies cadence from that date
 4. If effective date has passed:
    - Updates compliance policies with `osMinimumVersion` and `minAndroidSecurityPatchLevel`
@@ -249,7 +259,8 @@ Windows   Compliance    Range          Compliance-Windows-Corp     10.0.26100...
 
 ### Android
 - Supports both compliance and app-protection policies
-- `osMinimumVersion` is set to the oldest currently maintained Android version (e.g. 14), so devices on any supported release (14, 15, 16, 17, etc.) satisfy the compliance check; the maintained set is determined dynamically from the endoflife.date API
+- `osMinimumVersion` is set to the oldest currently maintained Android version by default (e.g. 14), so devices on any supported release satisfy the compliance check; the maintained set is determined dynamically from the endoflife.date API
+- Set `$AndroidMinimumVersion` to a specific version (e.g. `"16"`) to enforce a higher minimum. The value is validated against the live maintained list at runtime — if the version has gone EOL the script throws immediately rather than applying a stale policy
 - Security patch level is updated monthly, aligned with Android's fixed patch release schedule (1st of each month); cadence is applied from that date
 - Compliance policies: patch level written to `minAndroidSecurityPatchLevel`
 - App Protection policies: patch level written to `minimumRequiredPatchVersion`
@@ -282,7 +293,7 @@ Windows   Compliance    Range          Compliance-Windows-Corp     10.0.26100...
 
 ## Version History
 
-- **v1.2** (2026-07-01): Android multi-version support (targets oldest maintained release for `osMinimumVersion`); monthly Android security patch level enforcement (`minAndroidSecurityPatchLevel` / `minimumRequiredPatchVersion`); downgrade protection now evaluates OS version and patch level independently; `Get-AzAccessToken` SecureString compatibility for Az module 12.0+
+- **v1.2** (2026-07-01): Android multi-version support (targets oldest maintained release for `osMinimumVersion`); optional `$AndroidMinimumVersion` override with live EOL validation; monthly Android security patch level enforcement (`minAndroidSecurityPatchLevel` / `minimumRequiredPatchVersion`); downgrade protection now evaluates OS version and patch level independently; `Get-AzAccessToken` SecureString compatibility for Az module 12.0+; Windows App Protection cadence-check restructure to prevent false Error results
 - **v1.1** (2025-12-19): Added Azure Automation managed identity support, force-apply option, Windows app protection target selection, release date tracking
 - **v1.0** (2025-12-15): Initial release
 
