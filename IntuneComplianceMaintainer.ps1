@@ -123,13 +123,47 @@ function Get-GraphToken {
       }
     }
     "AppRegCert" {
-      $cert = Get-ChildItem Cert:\CurrentUser\My\$CertThumbprint
-      $assertion = [System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler]::WriteToken(
-        (New-Object System.IdentityModel.Tokens.Jwt.JwtSecurityToken(
-          $ClientId,$resourceScope,(New-Object System.Collections.Generic.List[System.Security.Claims.Claim]),
-          (Get-Date), (Get-Date).AddMinutes(10),
-          (New-Object System.IdentityModel.Tokens.X509SigningCredentials($cert))))
+      # Builds the JWT client assertion manually using only built-in .NET crypto (System.Security.Cryptography),
+      # avoiding a dependency on the System.IdentityModel.Tokens.Jwt assembly, which is not loaded by default
+      # in Windows PowerShell 5.1 and whose newer NuGet versions no longer expose X509SigningCredentials.
+      $cert = Get-Item "Cert:\CurrentUser\My\$CertThumbprint" -ErrorAction Stop
+      if (-not $cert.HasPrivateKey) {
+        throw "Certificate $CertThumbprint was found but has no private key, or is not present in Cert:\CurrentUser\My."
+      }
+
+      function script:ConvertTo-Base64UrlInternal([byte[]]$Bytes) {
+        [Convert]::ToBase64String($Bytes) -replace '\+','-' -replace '/','_' -replace '='
+      }
+
+      $nowUtc = [DateTimeOffset]::UtcNow
+      $expUtc = $nowUtc.AddMinutes(10)
+      $x5t    = ConvertTo-Base64UrlInternal $cert.GetCertHash()
+
+      $jwtHeader = @{ alg = "RS256"; typ = "JWT"; x5t = $x5t } | ConvertTo-Json -Compress
+      $jwtPayload = @{
+        aud = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+        iss = $ClientId
+        sub = $ClientId
+        jti = [guid]::NewGuid().ToString()
+        nbf = $nowUtc.ToUnixTimeSeconds()
+        exp = $expUtc.ToUnixTimeSeconds()
+      } | ConvertTo-Json -Compress
+
+      $headerEncoded  = ConvertTo-Base64UrlInternal ([System.Text.Encoding]::UTF8.GetBytes($jwtHeader))
+      $payloadEncoded = ConvertTo-Base64UrlInternal ([System.Text.Encoding]::UTF8.GetBytes($jwtPayload))
+      $unsignedToken  = "$headerEncoded.$payloadEncoded"
+
+      $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+      if (-not $rsa) {
+        throw "Could not obtain an RSA private key from certificate $CertThumbprint."
+      }
+      $signatureBytes = $rsa.SignData(
+        [System.Text.Encoding]::UTF8.GetBytes($unsignedToken),
+        [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+        [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
       )
+      $assertion = "$unsignedToken.$(ConvertTo-Base64UrlInternal $signatureBytes)"
+
       $body = @{
         client_id             = $ClientId
         scope                 = $resourceScope
@@ -192,7 +226,10 @@ function Write-ResultLog {
   $targetPatch = $null
   if ($Row.PSObject.Properties.Name -contains "TargetPatch") { $targetPatch = $Row.TargetPatch }
   $patchText = if ($targetPatch) { "; patch=$targetPatch" } else { "" }
-  Write-Host "[RESULT][$($Row.Platform)/$($Row.Type)] $($Row.Name): action=$($Row.Action); current=$($Row.Current); target=$($Row.Target)$patchText$settingText$relText$effText$errorText"
+  $currentWarning = $null
+  if ($Row.PSObject.Properties.Name -contains "CurrentWarning") { $currentWarning = $Row.CurrentWarning }
+  $warningText = if ($currentWarning) { "; currentWarning=$currentWarning" } else { "" }
+  Write-Host "[RESULT][$($Row.Platform)/$($Row.Type)] $($Row.Name): action=$($Row.Action); currentRequired=$($Row.CurrentRequired)$warningText; target=$($Row.Target)$patchText$settingText$relText$effText$errorText"
 }
 
 function Get-CompliancePolicyInfo {
@@ -212,7 +249,7 @@ function Get-CompliancePolicyInfo {
   if ($policy.PSObject.Properties.Name -contains "minAndroidSecurityPatchLevel") {
     $currentPatch = $policy.minAndroidSecurityPatchLevel
   }
-  return [pscustomobject]@{Name=$policy.displayName;Current=$currentOs;Ranges=$ranges;CurrentPatch=$currentPatch}
+  return [pscustomobject]@{Name=$policy.displayName;CurrentRequired=$currentOs;Ranges=$ranges;CurrentPatch=$currentPatch}
 }
 
 function Get-RangeText {
@@ -251,11 +288,19 @@ function Get-AppProtectionPolicyInfo {
   if (-not $current -and ($policy.PSObject.Properties.Name -contains "minimumRequiredOperatingSystem")) {
     $current = $policy.minimumRequiredOperatingSystem
   }
+
+  # Warning-level minimum OS version (Conditional launch action = "Warn"), independent from the
+  # Required/Block field above. A policy can have either, both, or neither configured.
+  $currentWarning = $policy.minimumWarningOsVersion
+  if (-not $currentWarning -and ($policy.PSObject.Properties.Name -contains "minimumWarningOSVersion")) {
+    $currentWarning = $policy.minimumWarningOSVersion
+  }
+
   $currentPatch = $null
   if ($policy.PSObject.Properties.Name -contains "minimumRequiredPatchVersion") {
     $currentPatch = $policy.minimumRequiredPatchVersion
   }
-  return [pscustomobject]@{Name=$policy.displayName;Current=$current;CurrentPatch=$currentPatch}
+  return [pscustomobject]@{Name=$policy.displayName;CurrentRequired=$current;CurrentWarning=$currentWarning;CurrentPatch=$currentPatch}
 }
 
 function Get-LatestOsVersion {
@@ -422,10 +467,10 @@ function Update-CompliancePolicy {
   $osUpToDate = $current -and ([version]$current -ge [version]$TargetVersion)
   $patchUpToDate = -not $PatchLevel -or ($currentPatch -and ($currentPatch -ge $PatchLevel))
   if (-not $AllowDowngrade -and $osUpToDate -and $patchUpToDate) {
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   if ($DryRun) {
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   try {
     $body = @{
@@ -438,13 +483,13 @@ function Update-CompliancePolicy {
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$detectedPlatform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
 }
 
@@ -465,7 +510,7 @@ function Update-WindowsCompliancePolicy {
   $targetText = Get-RangeText -Ranges $Ranges
 
   if ($DryRun) {
-    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;Current=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="WouldUpdate"}
+    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;CurrentRequired=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="WouldUpdate"}
   }
 
   $body = @{
@@ -477,13 +522,13 @@ function Update-WindowsCompliancePolicy {
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json -Depth 6)
     }
-    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;Current=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="Updated"}
+    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;CurrentRequired=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="Updated"}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;Current=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg}
+    return [pscustomobject]@{Platform="Windows";Type="Compliance";Setting="Range";Name=$name;CurrentRequired=$currentText;Target=$targetText;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg}
   }
 }
 
@@ -498,31 +543,47 @@ function Update-AppProtectionPolicy {
   $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-RestMethod -Method Get -Uri $uri -Headers $headers }
   $name = $policy.displayName
   $current = $policy.minimumRequiredOsVersion
+  $currentWarning = $policy.minimumWarningOsVersion
   $currentPatch = if ($Platform -eq "Android") { $policy.minimumRequiredPatchVersion } else { $null }
-  # Skip only when both OS version and patch level (if applicable) are already current.
-  $osUpToDate = $current -and ([version]$current -ge [version]$TargetVersion)
+
+  # Only touch whichever field(s) are already configured on the policy. This avoids silently
+  # turning on "Block" (minimumRequiredOsVersion) on a policy that was only ever configured with
+  # "Warn" (minimumWarningOsVersion), or vice versa - the admin's chosen conditional-launch action
+  # is preserved, only the version number is kept current.
+  $hasRequired = [bool]$current
+  $hasWarning  = [bool]$currentWarning
+
+  if (-not $hasRequired -and -not $hasWarning) {
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired="(none)";CurrentWarning="(none)";Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="NoData";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+  }
+
+  $requiredUpToDate = -not $hasRequired -or ([version]$current -ge [version]$TargetVersion)
+  $warningUpToDate  = -not $hasWarning -or ([version]$currentWarning -ge [version]$TargetVersion)
   $patchUpToDate = -not $PatchLevel -or ($currentPatch -and ($currentPatch -ge $PatchLevel))
-  if (-not $AllowDowngrade -and $osUpToDate -and $patchUpToDate) {
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+
+  if (-not $AllowDowngrade -and $requiredUpToDate -and $warningUpToDate -and $patchUpToDate) {
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Skipped";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   if ($DryRun) {
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="WouldUpdate";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   try {
-    $body = @{ minimumRequiredOsVersion = $TargetVersion }
+    $body = @{}
+    if ($hasRequired) { $body["minimumRequiredOsVersion"] = $TargetVersion }
+    if ($hasWarning)  { $body["minimumWarningOsVersion"]  = $TargetVersion }
     if ($Platform -eq "Android" -and $PatchLevel) {
       $body["minimumRequiredPatchVersion"] = $PatchLevel
     }
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Updated";TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;Current=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
+    return [pscustomobject]@{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$TargetVersion;ReleaseDate=$ReleaseDate;EffectiveDate=$EffectiveDate;Action="Error";Error=$errMsg;TargetPatch=$PatchLevel;CurrentPatch=$currentPatch}
   }
 }
 
@@ -597,14 +658,14 @@ foreach ($platform in $EolProducts.Keys) {
       if ($WindowsComplianceMode -eq "MinimumVersion") {
         $winMinVersion = Get-WindowsTargetVersionFromRanges -Ranges $winData.Ranges -Mode "HighestLowest"
         $targetText = $winMinVersion
-        $currentText = if ($info.Current) { $info.Current } else { Get-RangeText -Ranges $info.Ranges }
+        $currentText = if ($info.CurrentRequired) { $info.CurrentRequired } else { Get-RangeText -Ranges $info.Ranges }
 
         if ($notEffectiveCompliance -and -not $ForceApply) {
-          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;Current=$currentText;Target=$targetText;ReleaseDate=$winData.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$winData.EffectiveDate}
+          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;CurrentRequired=$currentText;Target=$targetText;ReleaseDate=$winData.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$winData.EffectiveDate}
           continue
         }
         if (-not $winMinVersion) {
-          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;Current=$currentText;Target="(none)";ReleaseDate=$winData.ReleaseDate;Action="NoData";EffectiveDate=$winData.EffectiveDate}
+          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;CurrentRequired=$currentText;Target="(none)";ReleaseDate=$winData.ReleaseDate;Action="NoData";EffectiveDate=$winData.EffectiveDate}
           continue
         }
         $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -TargetVersion $winMinVersion -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $winData.ReleaseDate
@@ -614,11 +675,11 @@ foreach ($platform in $EolProducts.Keys) {
         $currentText = Get-RangeText -Ranges $info.Ranges
 
         if ($notEffectiveCompliance -and -not $ForceApply) {
-          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;Current=$currentText;Target=$targetText;ReleaseDate=$winData.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$winData.EffectiveDate}
+          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;CurrentRequired=$currentText;Target=$targetText;ReleaseDate=$winData.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$winData.EffectiveDate}
           continue
         }
         if (-not $winData.Ranges -or $winData.Ranges.Count -eq 0) {
-          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;Current=$currentText;Target="(none)";ReleaseDate=$winData.ReleaseDate;Action="NoData";EffectiveDate=$winData.EffectiveDate}
+          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting=$WindowsComplianceMode;Name=$info.Name;CurrentRequired=$currentText;Target="(none)";ReleaseDate=$winData.ReleaseDate;Action="NoData";EffectiveDate=$winData.EffectiveDate}
           continue
         }
         $results += Update-WindowsCompliancePolicy -Token $token -PolicyId $policyId -Ranges $winData.Ranges -DryRun $DryRun -ReleaseDate $winData.ReleaseDate
@@ -629,7 +690,7 @@ foreach ($platform in $EolProducts.Keys) {
     if ($notEffectiveCompliance) {
       $info = Get-CompliancePolicyInfo -Token $token -PolicyId $policyId
       if (-not $ForceApply) {
-        $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$latest.Version;ReleaseDate=$latest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$latest.EffectiveDate;TargetPatch=$latest.PatchDate;CurrentPatch=$info.CurrentPatch}
+        $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$info.Name;CurrentRequired=$info.CurrentRequired;Target=$latest.Version;ReleaseDate=$latest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$latest.EffectiveDate;TargetPatch=$latest.PatchDate;CurrentPatch=$info.CurrentPatch}
         continue
       }
     }
@@ -645,7 +706,7 @@ foreach ($platform in $EolProducts.Keys) {
         $targetVersion = Get-WindowsTargetVersionFromRanges -Ranges $winData.Ranges -Mode $appTargetMode
       }
       if (-not $winData -or -not $winData.Ranges -or $winData.Ranges.Count -eq 0 -or -not $targetVersion) {
-        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;Current="(unknown)";Target="(none)";ReleaseDate=$releaseDate;Action="NoData";EffectiveDate=$effective}
+        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;CurrentRequired="(unknown)";Target="(none)";ReleaseDate=$releaseDate;Action="NoData";EffectiveDate=$effective}
         continue
       }
       # Check cadence before making any API calls; fetch info only when needed for the
@@ -653,7 +714,7 @@ foreach ($platform in $EolProducts.Keys) {
       if ($notEffectiveApp -and -not $ForceApply) {
         $policyName = $policyId
         try { $policyName = (Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform).Name } catch {}
-        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyName;Current="(unknown)";Target=$targetVersion;ReleaseDate=$releaseDate;Action="NotEffectiveYet";EffectiveDate=$effective}
+        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyName;CurrentRequired="(unknown)";Target=$targetVersion;ReleaseDate=$releaseDate;Action="NotEffectiveYet";EffectiveDate=$effective}
         continue
       }
       $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $targetVersion -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $releaseDate -EffectiveDate $effective
@@ -662,7 +723,7 @@ foreach ($platform in $EolProducts.Keys) {
 
     if ($notEffectiveApp -and -not $ForceApply) {
       $info = Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform
-      $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;Current=$info.Current;Target=$appLatest.Version;ReleaseDate=$appLatest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$appLatest.EffectiveDate;TargetPatch=$appLatest.PatchDate;CurrentPatch=$info.CurrentPatch}
+      $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$info.Name;CurrentRequired=$info.CurrentRequired;CurrentWarning=$info.CurrentWarning;Target=$appLatest.Version;ReleaseDate=$appLatest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$appLatest.EffectiveDate;TargetPatch=$appLatest.PatchDate;CurrentPatch=$info.CurrentPatch}
       continue
     }
     $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $appLatest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $appLatest.ReleaseDate -EffectiveDate $appLatest.EffectiveDate -PatchLevel $appLatest.PatchDate
@@ -675,5 +736,5 @@ if ($VerboseLogging) {
 }
 
 Write-Output "[MAIN] Displaying results table..."
-$results | Format-Table -AutoSize
+$results | Format-Table -Property Platform,Type,Setting,Name,CurrentRequired,CurrentWarning,Target,ReleaseDate,Action,EffectiveDate,TargetPatch,CurrentPatch,Error -AutoSize
 Write-Output "[MAIN] Script completed successfully"
