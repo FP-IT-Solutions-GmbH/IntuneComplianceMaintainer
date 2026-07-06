@@ -647,7 +647,10 @@ foreach ($platform in $EolProducts.Keys) {
       $appLatest = if ($latest) { $latest } else { Get-AndroidVersionData -CadenceDays $CadenceDays -MinVersionOverride $AndroidMinimumVersion }
       $notEffectiveApp = $now -lt $appLatest.EffectiveDate
     } else {
-      $appLatest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
+      # Reuse the already-fetched $latest instead of making a second, redundant call to the
+      # same endoflife.date endpoint - back-to-back calls risk rate-limiting, which previously
+      # could leave $appLatest.ReleaseDate as $null and crash Update-AppProtectionPolicy.
+      $appLatest = if ($latest) { $latest } else { Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays }
       $notEffectiveApp = $now -lt $appLatest.EffectiveDate
     }
   }
@@ -718,6 +721,13 @@ foreach ($platform in $EolProducts.Keys) {
         continue
       }
       $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $targetVersion -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $releaseDate -EffectiveDate $effective
+      continue
+    }
+
+    # Defensive guard: if $appLatest wasn't obtained (e.g. an API hiccup), report NoData instead
+    # of passing $null into Update-AppProtectionPolicy's typed [datetime] ReleaseDate parameter.
+    if (-not $appLatest -or -not $appLatest.ReleaseDate) {
+      $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;CurrentRequired="(unknown)";Target="(none)";ReleaseDate=$null;Action="NoData";EffectiveDate=$null}
       continue
     }
 
