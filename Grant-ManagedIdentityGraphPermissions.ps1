@@ -4,20 +4,34 @@
 
 .DESCRIPTION
   This script grants the required Graph API application permissions to a managed identity
-  so it can update Intune compliance and app protection policies.
+  so it can run IntuneComplianceMaintainer (this fork: iOS/iPadOS/macOS only) - updating
+  Intune Compliance and App Protection policies (Block 1), reading device-level OS version
+  for the compliance report (Block 2), and sending user notification emails (Block 3).
+
+  If you are not using Block 3 (no email notifications configured), remove
+  "Mail.Send" and "User.Read.All" from $requiredPermissions below before running this script -
+  least-privilege is always preferable to granting permissions you don't use.
 
 .NOTES
   Run this script with an account that has:
   - Application.ReadWrite.All permission in Microsoft Graph
   - Privileged Role Administrator or Global Administrator role in Entra ID
-  
+
   You must have the Microsoft.Graph PowerShell module installed:
   Install-Module Microsoft.Graph -Scope CurrentUser -Force
+
+  If you use Mail.Send, also restrict the managed identity to a single sending mailbox via
+  an Exchange Online Application Access Policy - otherwise it can send as ANY mailbox in the
+  tenant:
+    New-ApplicationAccessPolicy -AppId "<managed-identity-app-id>" `
+      -PolicyScopeGroupId "intune-automation@yourtenant.com" `
+      -AccessRight RestrictAccess `
+      -Description "Restrict to the automation mailbox"
 
 .EXAMPLE
   # For system-assigned managed identity
   .\Grant-ManagedIdentityGraphPermissions.ps1 -TenantId "your-tenant-id" -ManagedIdentityDisplayName "AutomationAccountName"
-  
+
   # For user-assigned managed identity
   .\Grant-ManagedIdentityGraphPermissions.ps1 -TenantId "your-tenant-id" -ManagedIdentityDisplayName "YourManagedIdentityName"
 #>
@@ -48,10 +62,18 @@ $graphSp = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000
 Write-Host "  Found: $($graphSp.DisplayName)" -ForegroundColor Green
 
 # Define required permissions
+# - DeviceManagementConfiguration.ReadWrite.All : Block 1, Compliance policies
+# - DeviceManagementApps.ReadWrite.All          : Block 1, App Protection policies
+# - DeviceManagementManagedDevices.Read.All     : Block 2, installed OS version per device
+# - Mail.Send                                   : Block 3, notification emails (remove if unused)
+# - User.Read.All                               : Block 3, resolving the device owner's mail address (remove if unused)
+# NOTE: WindowsUpdates.ReadWrite.All was removed - this fork no longer supports Windows/Android.
 $requiredPermissions = @(
   "DeviceManagementConfiguration.ReadWrite.All",
   "DeviceManagementApps.ReadWrite.All",
-  "WindowsUpdates.ReadWrite.All"
+  "DeviceManagementManagedDevices.Read.All",
+  "Mail.Send",
+  "User.Read.All"
 )
 
 Write-Host "`nGranting Graph API permissions..." -ForegroundColor Cyan
