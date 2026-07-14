@@ -1,184 +1,148 @@
 # IntuneComplianceMaintainer
 
-Automatically maintain Microsoft Intune Compliance and App Protection policies with the latest supported minimum OS versions, ensuring device access is restricted based on up-to-date device security.
+Keeps Microsoft Intune Compliance and App Protection minimum-OS-version requirements current for Apple platforms (iOS, iPadOS, macOS), and reports/notifies on device-level non-compliance.
 
-> **This is a locally patched version.** See [Changes in This Version](#changes-in-this-version-local-fixes) below for exactly what was changed compared to the original script from [SkipToTheEndpoint/IntuneComplianceMaintainer](https://github.com/SkipToTheEndpoint/IntuneComplianceMaintainer), and [Issues Found in the Original](#issues-found-in-the-original-script--docs) for problems identified in the upstream version.
-
-## Changes in This Version (Local Fixes)
-
-Three issues were found and fixed while testing the original script (v2.0, 2026-07-01) against a real tenant with a `AppRegCert`-based App Registration on a customer VM:
-
-### 1. Fixed: `AppRegCert` authentication failed with "Unable to find type" error
-
-**Problem:** The original `Get-GraphToken` function built the JWT client assertion using `[System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler]` and `[System.IdentityModel.Tokens.X509SigningCredentials]`. Neither type is loaded by default in Windows PowerShell 5.1, and modern versions of the underlying NuGet package no longer expose `X509SigningCredentials` in that namespace at all — so even manually installing the package did not resolve the error.
-
-**Fix:** The `AppRegCert` branch of `Get-GraphToken` now builds the JWT manually using only built-in .NET cryptography (`System.Security.Cryptography`), with no external assembly dependency:
-- Header/payload are JSON-encoded and Base64URL-encoded by hand
-- The assertion is signed via `RSACertificateExtensions.GetRSAPrivateKey($cert).SignData(...)` (RS256 / PKCS1)
-- The resulting `client_assertion` is sent to the token endpoint exactly as before
-
-No configuration changes are needed — `$AuthMode = "AppRegCert"`, `$TenantId`, `$ClientId`, and `$CertThumbprint` work exactly as documented. The certificate still needs to be in `Cert:\CurrentUser\My` (this was already correctly documented in the original Prerequisites section).
-
-### 2. Fixed: App Protection policies using "Warn" instead of "Block" were invisible to the script
-
-**Problem:** iOS/Android App Protection conditional-launch rules for minimum OS version can be configured with either action:
-- **Block access** → Graph field `minimumRequiredOsVersion`
-- **Warn** → Graph field `minimumWarningOsVersion`
-
-The original script only ever read and wrote `minimumRequiredOsVersion`. A policy configured only with the "Warn" action (a common, less disruptive rollout choice) showed an empty `Current` value and was never actually updated, even though the script reported a result row for it.
-
-**Fix:**
-- `Get-AppProtectionPolicyInfo` now also reads `minimumWarningOsVersion` into a new `CurrentWarning` property
-- `Update-AppProtectionPolicy` now detects which field(s) are actually configured on each policy and updates only those — a policy with only "Warn" configured gets `minimumWarningOsVersion` updated; a policy with only "Block" configured gets `minimumRequiredOsVersion` updated; a policy with both configured gets both updated. **Neither field is added to a policy that didn't already have it** — the fix does not silently turn on blocking where only a warning previously existed, or vice versa.
-- A new `NoData` result is returned if a policy has neither field configured at all.
-
-### 3. Renamed: `Current` → `CurrentRequired` for clarity
-
-**Problem:** With the addition of `CurrentWarning`, the original `Current` property name became ambiguous — it specifically means the *Block* value, not "whichever value happens to be set".
-
-**Fix:** Renamed throughout the script (result objects, console `[RESULT]` log line, and the final summary table) to `CurrentRequired`, matching the Graph field name `minimumRequiredOsVersion`. The summary table's column list is now specified explicitly (`Format-Table -Property ...`) rather than relying on automatic schema detection — the original approach silently dropped the `CurrentWarning` column whenever the *first* row in the result set happened to be a Compliance policy (which never has that property), regardless of whether later App Protection rows had a value.
-
-## Issues Found in the Original Script / Docs
-
-These were not fixed (no code change made) but are worth being aware of:
-
-- **Version number mismatch:** the script header comment states `Version: v2.0, Release Date: 2026-07-01`, while the README's Version History section only lists up to `v1.2 (2026-07-01)`. The documented feature set (Android multi-version support, patch level enforcement, etc.) matches v1.2 — it's unclear what changed in v2.0, since it isn't documented anywhere.
-- **`$WindowsAllowNewerBuilds` default mismatch:** the README's example configuration snippet shows `$WindowsAllowNewerBuilds = $true` with the comment "Allow devices on newer builds (e.g. Preview Updates)", but the actual script default is `$false`. Worth double-checking which value you actually want before relying on the README example verbatim.
-- **No mention of the `AppRegCert` assembly dependency:** the original Prerequisites section lists Graph permissions and modules for Managed Identity / Key Vault, but never mentions that the original (unpatched) certificate-auth code path required `System.IdentityModel.Tokens.Jwt` to already be loaded in the session — which isn't guaranteed on a plain Windows Server/VM outside Azure Automation. This is now moot with the fix above, but would have caused the same failure for any user following the documented setup steps exactly.
-- **No mention of `minimumWarningOsVersion` anywhere in the original docs:** the "How It Works" and "Output" sections describe App Protection updates purely in terms of `minimumRequiredOsVersion`. Given "Warn" is a completely standard, commonly used conditional-launch action in Intune, this looks like an oversight rather than an intentional scope limitation — worth flagging to the upstream author.
-
----
+Maintained by FP-IT-Solutions GmbH. Originally based on [SkipToTheEndpoint/IntuneComplianceMaintainer](https://github.com/SkipToTheEndpoint/IntuneComplianceMaintainer); substantially rewritten (see [Changelog](#changelog-vs-upstream) below) — Android and Windows support removed, Warn-field support added, device-level compliance reporting and per-user email notification added, split cadence for Warn vs. Block, and several reliability fixes.
 
 ## Overview
 
-IntuneComplianceMaintainer is a PowerShell automation script that keeps your Intune compliance and app-protection policies up-to-date with the latest OS version requirements across all major platforms. By leveraging the [endoflife.date API](https://endoflife.date/docs/api/v1/) and [Microsoft Graph Windows Update Catalog](https://learn.microsoft.com/en-us/graph/api/windowsupdates-catalog-list-entries?view=graph-rest-beta&tabs=http) data sources, it ensures your organisation maintains security posture while respecting configurable cadence periods for gradual rollout.
+The script is organized into three independently switchable blocks:
 
-## Features
+1. **Policy Maintenance** (`$RunPolicyMaintenance`) — reads the current minimum OS version from your Compliance and App Protection policies, checks the latest publicly available OS version via [endoflife.date](https://endoflife.date/docs/api/v1/), and — once the configured cadence period has elapsed — updates the policy. The only block that writes to Intune, and only when `$DryRun` is `$false`.
+2. **Device Compliance Report** (`$CheckDeviceCompliance`) — read-only. Lists every device evaluated against the configured policies, compares installed vs. required version, and saves a CSV **and** a self-contained, sortable/filterable HTML report to `$DeviceComplianceReportPath`.
+3. **User Notification Email** (`$SendUserNotificationEmail`) — sends one individual email per non-compliant device to its owner. Requires Block 2's data. Never sends a real email while `$DryRun` is `$true` — it only logs what it would send.
 
-- **Multi-Platform Support**: iOS, iPadOS, macOS, Android, and Windows
-- **Dual Policy Types**: Updates both compliance and app-protection policies
-- **Warn and Block Support** *(local fix)*: App Protection minimum OS version is tracked and updated independently for both the "Warn" (`minimumWarningOsVersion`) and "Block" (`minimumRequiredOsVersion`) conditional-launch actions
-- **Flexible Authentication**: Supports Managed Identity (Azure Automation), App Registration with Certificate (now dependency-free, see fixes above), or App Registration with Secret (including Azure Key Vault integration)
-- **Cadence Control**: Configurable delay between update release and policy enforcement to account for update rollout schedule, with optional force-apply override
-- **Android Patch Level**: Enforces minimum Android security patch level alongside OS version; targets the oldest maintained Android version for `osMinimumVersion` (so any supported release passes) and derives the monthly patch date from Android's patch schedule (1st of each month)
-- **Windows Advanced Options**: Support for specific build numbers, update classifications, version ranges, and selectable app-protection target build (lowest by default)
-- **Safety Features**: Optional downgrade protection and dry-run mode (downgrade check covers OS version, warning version, and patch level independently)
-- **Retry Logic**: Built-in retry mechanism for API resilience
-- **Comprehensive Logging**: Verbose logging with detailed result output
+`$DryRun = $true` disables **all** side effects at once: no policy writes (Block 1) and no emails sent (Block 3). Block 2 is always read-only regardless of `$DryRun`.
+
+## Supported platforms
+
+- **iOS** — Compliance and App Protection
+- **iPadOS** — Compliance and App Protection
+- **macOS** — Compliance only (Intune has no App Protection support for macOS)
+
+Android and Windows are intentionally not supported by this fork.
 
 ## Prerequisites
 
-- PowerShell 5.1 or later
-- Microsoft Graph API permissions:
-  - `DeviceManagementConfiguration.ReadWrite.All` (for Compliance policies)
-  - `DeviceManagementApps.ReadWrite.All` (for App Protection policies)
-  - `WindowsUpdates.ReadWrite.All` (for Windows Update Catalog queries — only needed if automating Windows)
-- For Managed Identity authentication: `Az.Accounts` module (pre-installed in Azure Automation)
-- For Key Vault integration: `Az.KeyVault` module and appropriate Key Vault access
-- For certificate authentication: certificate installed in `Cert:\CurrentUser\My` store (private key required); **no external assembly needed** — the JWT is built with built-in .NET crypto (local fix)
+- PowerShell 5.1 or later (Windows PowerShell or PowerShell 7)
+- An Entra ID App Registration (or an Azure Automation Managed Identity) with the following **Application permissions** (admin-consented) on Microsoft Graph:
+
+| Permission | Needed for |
+|---|---|
+| `DeviceManagementConfiguration.ReadWrite.All` | Reading/writing Compliance policies |
+| `DeviceManagementApps.ReadWrite.All` | Reading/writing App Protection policies |
+| `DeviceManagementManagedDevices.Read.All` | Reading installed OS version per device (Block 2) |
+| `Mail.Send` | Sending notification emails (Block 3 only) |
+| `User.Read.All` | Resolving the real primary SMTP address for the device owner (Block 3 only) |
+
+If you use `Mail.Send`, restrict the App Registration to a single sending mailbox with an Exchange Online **Application Access Policy** — otherwise the app can send as *any* mailbox in the tenant:
+
+```powershell
+New-ApplicationAccessPolicy -AppId "<client-id>" `
+    -PolicyScopeGroupId "intune-automation@yourtenant.com" `
+    -AccessRight RestrictAccess `
+    -Description "Restrict to the automation mailbox"
+```
+
+For certificate authentication, the certificate must be installed with its private key in `Cert:\CurrentUser\My` — of whichever Windows account actually runs the script (careful with scheduled tasks running under a service account).
 
 ## Configuration
 
-### Authentication Settings
+### Authentication
 
-#### Managed Identity
 ```powershell
-$AuthMode = "ManagedIdentity"
-$TenantId = "your-tenant-id"
-$UserAssignedClientId = "" # optional
+# ManagedIdentity | AppRegCert | AppRegSecret
+$AuthMode              = "AppRegCert"
+$TenantId              = "<tenant-id>"
+$ClientId              = "<client-id>"
+$CertThumbprint        = "<thumbprint>"          # AppRegCert only
+$ClientSecret          = "<secret>"              # AppRegSecret only
+$UserAssignedClientId  = ""                      # ManagedIdentity, optional
+$KeyVaultName          = ""                      # AppRegSecret, optional
+$KeyVaultSecretName    = ""                       # AppRegSecret, optional
 ```
 
-#### App Registration with Certificate
-```powershell
-$AuthMode = "AppRegCert"
-$TenantId = "your-tenant-id"
-$ClientId = "your-client-id"
-$CertThumbprint = "certificate-thumbprint"
-```
-
-#### App Registration with Secret
-```powershell
-$AuthMode = "AppRegSecret"
-$TenantId = "your-tenant-id"
-$ClientId = "your-client-id"
-$ClientSecret = "your-client-secret"
-
-# Optional: Use Key Vault
-$KeyVaultName = "your-keyvault-name"
-$KeyVaultSecretName = "your-secret-name"
-```
-
-### Environment Configuration
+### Policies and cadence
 
 ```powershell
-$CadenceDays = 14
+# Compliance + App Protection "Block" cadence
+$CadenceDays        = 30
+# App Protection "Warn" cadence — typically shorter, so users get warned well before
+# the stricter Block deadline. Not used for Compliance policies (no separate Warn field there).
+$CadenceDaysWarning = 14
 
-$CompliancePolicies = @{
-  iOS     = @("policy-guid-1", "policy-guid-2")
-  iPadOS  = @("policy-guid-3")
-  macOS   = @()
-  Android = @("policy-guid-4")
-  Windows = @("policy-guid-5")
-}
+$CompliancePolicies = @{ iOS = @(); iPadOS = @(); macOS = @() }
+$AppProtectionPolicies = @{ iOS = @(); iPadOS = @() }
 
-$AppProtectionPolicies = @{
-  iOS     = @("policy-guid-6")
-  iPadOS  = @()
-  Android = @("policy-guid-7")
-  Windows = @("policy-guid-8")
-}
-```
-
-### Safety Settings
-
-```powershell
 $AllowDowngrade = $false
 $DryRun         = $true
-$ForceApply     = $false
+$ForceApply     = $false   # bypasses cadence, applies to both Warn and Block deadlines
 ```
 
-## Usage
+### Block switches
 
-1. Configure authentication and policy IDs in the script
-2. Run with `$DryRun = $true` first and review the output
-3. Set `$DryRun = $false` for a production run
+```powershell
+$RunPolicyMaintenance = $true
 
-Even with `$DryRun = $false`, no change is made until `EffectiveDate` (release date + `$CadenceDays`) has passed — use `$ForceApply = $true` temporarily to test the write path before that date, then set it back to `$false` for production.
+$CheckDeviceCompliance             = $false
+$CompareAgainstLatestPublicVersion = $false   # fallback to latest public OS version if a policy has no minimum configured
+$ShowDeviceComplianceList          = $false   # also print the device table to console
+$DeviceComplianceReportPath        = "C:\Reports"
 
-## Output
-
-```
-[RESULT][iOS/Compliance]    test:     action=NotEffectiveYet; currentRequired=23.5; target=26.5.2; ...
-[RESULT][iOS/AppProtection] test_123: action=NotEffectiveYet; currentRequired=23.4; currentWarning=22.4; target=26.5.2; ...
-
-Platform Type          Setting        Name     CurrentRequired CurrentWarning Target ... Action          ...
--------- ----          -------        ----     --------------- -------------- ------ --- ------          ---
-iOS      Compliance    MinimumVersion test     23.5                           26.5.2 ... NotEffectiveYet ...
-iOS      AppProtection MinimumVersion test_123 23.4            22.4           26.5.2 ... NotEffectiveYet ...
+$SendUserNotificationEmail = $false           # requires $CheckDeviceCompliance = $true
+$EmailSenderAddress        = "<sender-mailbox@yourtenant.onmicrosoft.com>"
 ```
 
-## Action Types
+## How it works
 
-- **Updated**: Policy was successfully updated
-- **WouldUpdate**: Policy would be updated (dry-run mode)
-- **Skipped**: Current version(s) meet or exceed target (downgrade protection)
-- **NotEffectiveYet**: Cadence period hasn't elapsed
-- **NoData**: No version data available (or, for App Protection, neither `minimumRequiredOsVersion` nor `minimumWarningOsVersion` is configured on the policy)
-- **Error**: Update failed (see error details in output)
+### Block 1 — Policy Maintenance
 
-## Security Considerations
+For each configured platform, the script fetches the latest OS version and release date from endoflife.date, then computes two independent deadlines from that release date:
 
-- Store secrets in Azure Key Vault when using `AppRegSecret` mode
-- Prefer certificate authentication over secrets for non-Azure-Automation scenarios (longer validity, private key never leaves the machine)
-- Use Managed Identity for Azure Automation scenarios
-- Apply least-privilege Graph API permissions
-- Review audit logs for policy changes
-- Test in a non-production environment first
+- `WarningEffectiveDate = ReleaseDate + $CadenceDaysWarning`
+- `RequiredEffectiveDate = ReleaseDate + $CadenceDays`
 
-## License
+Each App Protection policy's `minimumWarningOsVersion` (Warn) and `minimumRequiredOsVersion` (Block) fields are then evaluated **independently** against their own deadline. A policy can end up with only the Warn field updated in a given run while Block is not yet due — this is expected, and shows up as `Updated (nur Warn - Block noch nicht faellig)` (or the reverse) rather than a plain `Updated`. Only fields that are already configured on the policy are ever touched — the script never turns on Block where only Warn existed, or vice versa.
 
-Use at your own discretion. Review and test thoroughly before production deployment.
+Compliance policies only have the single `osMinimumVersion` field and use `$CadenceDays` only.
+
+### Block 2 — Device Compliance Report
+
+- **Compliance policies**: uses the documented Graph endpoint `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` for the device list, then correlates each entry by ID to `/deviceManagement/managedDevices/{id}` for the installed OS version, device model, and last sync time. This ID correlation is a widely used community pattern, not explicitly documented by Microsoft — verify in Graph Explorer if results look off for your tenant.
+- **App Protection policies**: the simple per-policy device-status endpoint is not reliably available across tenants. Instead, this uses the asynchronous **Intune Reports export API** (`/deviceManagement/reports/exportJobs`, report `MAMAppProtectionStatus`): create the export job, poll until complete, download the ZIP, extract, and parse. Despite Microsoft's own documentation stating this report has "no filters," it does include a `Policy` column with the policy's display name, which the script uses to attribute rows to the correct policy.
+- Output: `IntuneDeviceComplianceReport_<timestamp>.csv` and a matching `.html` file with click-to-sort columns, a per-column text filter row, and non-compliant rows highlighted in red — fully self-contained (no external JS/CSS, works offline).
+
+### Block 3 — User Notification Email
+
+Reuses Block 2's device list, filters to `Compliant = "No"` rows with a resolvable user, looks up each user's real primary SMTP address via `/users/{upn}` (falls back to the UPN if the lookup fails — UPN and primary email are not always the same, e.g. with an on-prem `.local` UPN suffix), and sends one individual email per device via `/users/{sender}/sendMail`. The email's stated deadline (`$CadenceDays` vs. `$CadenceDaysWarning`) automatically matches whichever rule (Warn or Block) triggered the notification.
+
+## Known limitations
+
+- The `MAMAppProtectionStatus` report schema was determined empirically (Microsoft's public documentation doesn't list exact column names) — if your tenant returns different column names, the script's keyword-based lookup (`Get-PropertyValueLike`) may not find the expected field. Check the `[INFO]` diagnostic log lines (report row count, column names, and any "no match" warnings) if device data comes back empty.
+- Apple device model values (e.g. `iPhone12,1`) are Apple's internal identifiers, not human-readable names — there's no official API mapping these to marketing names (e.g. "iPhone 11").
+- Windows PowerShell 5.1's `Invoke-RestMethod`/`Invoke-WebRequest` mis-decode UTF-8 as ISO-8859-1 for JSON responses without an explicit charset (mangling German umlauts/ß). Worked around via a raw `HttpWebRequest`-based `Invoke-GraphGet` wrapper for GET calls. If a display name still looks wrong even under PowerShell 7 (which doesn't have this bug), the value is very likely genuinely corrupted in the stored Intune object itself (e.g. from an earlier tool with the same bug) — check directly in the Intune portal.
+
+## Troubleshooting
+
+**"Unable to find type [System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler]"** — this only affects the *original* upstream script; this fork builds the JWT client assertion manually with built-in .NET crypto (`System.Security.Cryptography`), no external assembly needed.
+
+**"AADSTS7000215: Invalid client secret provided"** — you've entered the Secret **ID** (a plain GUID) instead of the Secret **Value** from Entra ID → Certificates & secrets. The value is only shown once, right after creating the secret.
+
+**Certificate not found** — must be in `Cert:\CurrentUser\My` of the account actually running the script (not `Cert:\LocalMachine\My`), with its private key.
+
+## Changelog vs. upstream
+
+- Removed Android and Windows support entirely (iOS/iPadOS/macOS only)
+- Added support for the App Protection "Warn" field (`minimumWarningOsVersion`), independent from "Block" (`minimumRequiredOsVersion`) — previously only Block was read/written
+- Split cadence: separate, shorter cadence for Warn vs. Block
+- Renamed `Current` → `CurrentRequired` for clarity now that `CurrentWarning` exists
+- Fixed `AppRegCert` authentication: rebuilt without the `System.IdentityModel.Tokens.Jwt` dependency
+- Fixed a redundant duplicate API call to endoflife.date for App Protection cadence checks (reuses the Compliance check's result)
+- Fixed Windows PowerShell 5.1 UTF-8 mangling via a custom `Invoke-GraphGet` wrapper
+- Added device-level compliance reporting (Block 2), including CSV and filterable/sortable HTML output, device model, and last-sync timestamp
+- Added per-user individual email notification for non-compliant devices (Block 3), fully `$DryRun`-safe
+- Fixed a property-lookup priority bug that could pick a display name instead of an email address when building notification recipients
 
 ## Disclaimer
 
-This script modifies production Intune policies. Always test in a non-production environment and use dry-run mode before live deployment. Neither the original author nor the author of these local fixes assumes any liability for unintended changes or impacts to your environment.
+This script modifies production Intune policies and can send email on your organization's behalf. Always test with `$DryRun = $true` first, in a non-production environment if possible. Neither the original upstream author nor FP-IT-Solutions GmbH assumes any liability for unintended changes or impacts to your environment.
