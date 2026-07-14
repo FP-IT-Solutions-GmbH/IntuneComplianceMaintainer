@@ -1,184 +1,149 @@
 # IntuneComplianceMaintainer
 
-Pflegt automatisch die Minimum-OS-Version in Microsoft Intune Compliance- und App-Protection-Richtlinien, sodass der Gerätezugriff stets auf Basis eines aktuellen Sicherheitsstands eingeschränkt wird.
+Hält die Minimum-OS-Version-Anforderungen in Microsoft Intune Compliance- und App-Protection-Richtlinien für Apple-Plattformen (iOS, iPadOS, macOS) aktuell und berichtet über bzw. informiert bei nicht-konformen Geräten.
 
-> **Dies ist eine lokal angepasste Version.** Siehe [Änderungen in dieser Version](#änderungen-in-dieser-version-lokale-fixes) für die genauen Unterschiede zum Originalskript von [SkipToTheEndpoint/IntuneComplianceMaintainer](https://github.com/SkipToTheEndpoint/IntuneComplianceMaintainer), sowie [Gefundene Probleme im Original](#gefundene-probleme-im-original-skriptdokumentation) für Auffälligkeiten in der Upstream-Version.
+Gepflegt von FP-IT-Solutions GmbH. Ursprünglich basierend auf [SkipToTheEndpoint/IntuneComplianceMaintainer](https://github.com/SkipToTheEndpoint/IntuneComplianceMaintainer); grundlegend überarbeitet (siehe [Änderungsprotokoll](#änderungsprotokoll-gegenüber-dem-original) unten) — Android- und Windows-Support entfernt, Unterstützung für das Warn-Feld ergänzt, geräteweise Compliance-Berichterstattung und individuelle E-Mail-Benachrichtigung hinzugefügt, getrennte Cadence-Zeiten für Warn vs. Block, sowie mehrere Stabilitäts-Fixes.
 
-## Änderungen in dieser Version (lokale Fixes)
+## Überblick
 
-Beim Testen des Originalskripts (v2.0, 01.07.2026) gegen einen echten Tenant mit einer `AppRegCert`-basierten App-Registrierung auf einer Kunden-VM wurden drei Probleme gefunden und behoben:
+Das Skript ist in drei unabhängig voneinander schaltbare Blöcke gegliedert:
 
-### 1. Behoben: `AppRegCert`-Authentifizierung schlug mit "Unable to find type" fehl
+1. **Policy Maintenance** (`$RunPolicyMaintenance`) — liest die aktuell konfigurierte Minimum-OS-Version aus euren Compliance- und App-Protection-Richtlinien, prüft die neueste öffentlich verfügbare OS-Version über [endoflife.date](https://endoflife.date/docs/api/v1/), und aktualisiert die Richtlinie, sobald die konfigurierte Cadence-Zeit abgelaufen ist. Der einzige Block, der in Intune schreibt — und das nur, wenn `$DryRun` auf `$false` steht.
+2. **Device Compliance Report** (`$CheckDeviceCompliance`) — rein lesend. Listet jedes Gerät auf, das gegen die konfigurierten Richtlinien ausgewertet wird, vergleicht installierte mit geforderter Version, und speichert einen CSV- **und** einen eigenständigen, sortier-/filterbaren HTML-Bericht unter `$DeviceComplianceReportPath`.
+3. **User Notification Email** (`$SendUserNotificationEmail`) — verschickt eine individuelle E-Mail pro nicht-konformem Gerät an dessen Besitzer. Setzt die Daten aus Block 2 voraus. Verschickt bei `$DryRun = $true` **keine** echte E-Mail — es wird nur geloggt, was verschickt würde.
 
-**Problem:** Die ursprüngliche `Get-GraphToken`-Funktion baute die JWT-Client-Assertion mit `[System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler]` und `[System.IdentityModel.Tokens.X509SigningCredentials]`. Keiner dieser Typen ist in Windows PowerShell 5.1 standardmäßig geladen, und neuere Versionen des zugrunde liegenden NuGet-Pakets stellen `X509SigningCredentials` in diesem Namespace gar nicht mehr bereit — selbst eine manuelle Paketinstallation behob den Fehler daher nicht.
+`$DryRun = $true` deaktiviert **alle** Seiteneffekte gleichzeitig: keine Richtlinien-Schreibvorgänge (Block 1) und kein Mailversand (Block 3). Block 2 ist unabhängig von `$DryRun` immer rein lesend.
 
-**Fix:** Der `AppRegCert`-Zweig von `Get-GraphToken` baut den JWT jetzt manuell ausschließlich mit eingebauter .NET-Kryptografie (`System.Security.Cryptography`), ganz ohne externe Assembly-Abhängigkeit:
-- Header/Payload werden von Hand JSON- und Base64URL-kodiert
-- Die Signatur erfolgt über `RSACertificateExtensions.GetRSAPrivateKey($cert).SignData(...)` (RS256 / PKCS1)
-- Die resultierende `client_assertion` wird wie zuvor an den Token-Endpunkt gesendet
+## Unterstützte Plattformen
 
-Es sind keine Konfigurationsänderungen nötig — `$AuthMode = "AppRegCert"`, `$TenantId`, `$ClientId` und `$CertThumbprint` funktionieren genau wie dokumentiert. Das Zertifikat muss weiterhin in `Cert:\CurrentUser\My` liegen (das war im Original-Prerequisites-Abschnitt bereits korrekt dokumentiert).
+- **iOS** — Compliance und App Protection
+- **iPadOS** — Compliance und App Protection
+- **macOS** — nur Compliance (Intune bietet für macOS keine App-Protection-Unterstützung)
 
-### 2. Behoben: App-Protection-Richtlinien mit Aktion "Warnung" statt "Zugriff blockieren" wurden vom Skript nicht erkannt
-
-**Problem:** Bedingte-Start-Regeln (Conditional Launch) für die Minimum-OS-Version bei iOS/Android App-Protection-Richtlinien können mit einer von zwei Aktionen konfiguriert werden:
-- **Zugriff blockieren** → Graph-Feld `minimumRequiredOsVersion`
-- **Warnung** → Graph-Feld `minimumWarningOsVersion`
-
-Das Originalskript hat ausschließlich `minimumRequiredOsVersion` gelesen und geschrieben. Eine Richtlinie, die nur mit der Aktion "Warnung" konfiguriert war (eine übliche, weniger einschneidende Rollout-Wahl), zeigte einen leeren `Current`-Wert und wurde nie tatsächlich aktualisiert — obwohl das Skript für sie eine Ergebniszeile ausgab.
-
-**Fix:**
-- `Get-AppProtectionPolicyInfo` liest jetzt zusätzlich `minimumWarningOsVersion` in eine neue `CurrentWarning`-Eigenschaft ein
-- `Update-AppProtectionPolicy` erkennt jetzt automatisch, welche(s) Feld(er) auf der jeweiligen Richtlinie tatsächlich konfiguriert ist/sind, und aktualisiert nur diese — eine Richtlinie mit nur "Warnung" bekommt `minimumWarningOsVersion` aktualisiert, eine mit nur "Zugriff blockieren" bekommt `minimumRequiredOsVersion` aktualisiert, eine mit beidem bekommt beides aktualisiert. **Keines der beiden Felder wird bei einer Richtlinie neu gesetzt, die es vorher nicht hatte** — der Fix schaltet also nicht heimlich Blockieren zu, wo bisher nur eine Warnung existierte, oder umgekehrt.
-- Ein neuer Status `NoData` wird zurückgegeben, falls eine Richtlinie überhaupt keines der beiden Felder konfiguriert hat.
-
-### 3. Umbenannt: `Current` → `CurrentRequired` zur Klarstellung
-
-**Problem:** Mit der Einführung von `CurrentWarning` wurde die ursprüngliche Eigenschaft `Current` mehrdeutig — sie meint konkret den *Block*-Wert, nicht "irgendeinen der beiden Werte, je nachdem was gesetzt ist".
-
-**Fix:** Im gesamten Skript umbenannt (Ergebnisobjekte, Konsolen-`[RESULT]`-Logzeile und die abschließende Zusammenfassungstabelle) in `CurrentRequired`, passend zum Graph-Feldnamen `minimumRequiredOsVersion`. Die Spaltenliste der Zusammenfassungstabelle wird jetzt explizit angegeben (`Format-Table -Property ...`) statt sich auf die automatische Schema-Erkennung zu verlassen — der ursprüngliche Ansatz ließ die `CurrentWarning`-Spalte stillschweigend verschwinden, sobald die *erste* Zeile im Ergebnis-Array zufällig eine Compliance-Richtlinie war (die dieses Feld grundsätzlich nie hat), unabhängig davon, ob spätere App-Protection-Zeilen einen Wert hatten.
-
-## Gefundene Probleme im Original-Skript/-Dokumentation
-
-Diese wurden **nicht** behoben (keine Codeänderung), sind aber erwähnenswert:
-
-- **Versionsnummer-Diskrepanz:** Der Skript-Header-Kommentar nennt `Version: v2.0, Release Date: 2026-07-01`, während die README-Versionshistorie nur bis `v1.2 (2026-07-01)` reicht. Der dort beschriebene Funktionsumfang (Android-Multi-Version-Support, Patch-Level-Enforcement etc.) entspricht v1.2 — unklar bleibt, was sich in v2.0 geändert hat, da dies nirgends dokumentiert ist.
-- **Abweichender Default bei `$WindowsAllowNewerBuilds`:** Das Beispiel-Konfigurationsschnipsel in der README zeigt `$WindowsAllowNewerBuilds = $true` mit dem Kommentar "Allow devices on newer builds (e.g. Preview Updates)", der tatsächliche Skript-Default ist jedoch `$false`. Vor dem 1:1-Übernehmen des README-Beispiels lohnt sich ein bewusster Check, welcher Wert tatsächlich gewünscht ist.
-- **Keine Erwähnung der `AppRegCert`-Assembly-Abhängigkeit:** Der ursprüngliche Prerequisites-Abschnitt listet Graph-Berechtigungen und Module für Managed Identity/Key Vault auf, erwähnt aber nirgends, dass der ursprüngliche (ungepatchte) Zertifikats-Auth-Codepfad voraussetzte, dass `System.IdentityModel.Tokens.Jwt` bereits in der Session geladen ist — was außerhalb von Azure Automation auf einer normalen Windows Server/VM nicht garantiert ist. Mit dem obigen Fix ist das nun hinfällig, hätte aber bei exaktem Befolgen der dokumentierten Setup-Schritte denselben Fehler verursacht.
-- **`minimumWarningOsVersion` wird in der Original-Doku nirgends erwähnt:** Die Abschnitte "How It Works" und "Output" beschreiben App-Protection-Updates ausschließlich über `minimumRequiredOsVersion`. Da "Warnung" eine völlig gängige, häufig genutzte Conditional-Launch-Aktion in Intune ist, wirkt das eher wie ein Versehen als eine bewusste Scope-Einschränkung — sollte dem Original-Autor gemeldet werden.
-
----
-
-## Übersicht
-
-IntuneComplianceMaintainer ist ein PowerShell-Automatisierungsskript, das Intune Compliance- und App-Protection-Richtlinien plattformübergreifend mit den aktuellen OS-Versionsanforderungen auf dem Laufenden hält. Über die [endoflife.date-API](https://endoflife.date/docs/api/v1/) und den [Microsoft Graph Windows Update Catalog](https://learn.microsoft.com/en-us/graph/api/windowsupdates-catalog-list-entries?view=graph-rest-beta&tabs=http) wird sichergestellt, dass der Sicherheitsstand der Organisation aktuell bleibt, während konfigurierbare Cadence-Zeiträume ein schrittweises Rollout ermöglichen.
-
-## Funktionen
-
-- **Multi-Plattform-Support**: iOS, iPadOS, macOS, Android und Windows
-- **Zwei Richtlinientypen**: Aktualisiert sowohl Compliance- als auch App-Protection-Richtlinien
-- **Warn- und Block-Unterstützung** *(lokaler Fix)*: Die Minimum-OS-Version wird für App-Protection-Richtlinien unabhängig sowohl für "Warnung" (`minimumWarningOsVersion`) als auch für "Zugriff blockieren" (`minimumRequiredOsVersion`) nachverfolgt und aktualisiert
-- **Flexible Authentifizierung**: Managed Identity (Azure Automation), App-Registrierung mit Zertifikat (jetzt ohne externe Abhängigkeit, siehe Fixes oben) oder App-Registrierung mit Secret (inkl. Azure-Key-Vault-Integration)
-- **Cadence-Steuerung**: Konfigurierbare Verzögerung zwischen Release und Enforcement, mit optionalem Force-Apply
-- **Android-Patch-Level**: Setzt zusätzlich zur OS-Version das minimale Android-Sicherheitspatch-Level durch; zielt standardmäßig auf die älteste noch unterstützte Android-Version für `osMinimumVersion` ab und leitet das monatliche Patch-Datum aus Androids Patch-Zeitplan ab (1. jedes Monats)
-- **Windows-Erweiterungen**: Unterstützung für spezifische Build-Nummern, Update-Klassifizierungen, Versionsbereiche und wählbares App-Protection-Zielbuild (standardmäßig das niedrigste)
-- **Sicherheitsfunktionen**: Optionaler Downgrade-Schutz und Dry-Run-Modus (Downgrade-Prüfung berücksichtigt OS-Version, Warn-Version und Patch-Level unabhängig voneinander)
-- **Retry-Logik**: Eingebauter Wiederholungsmechanismus für API-Robustheit
-- **Umfassendes Logging**: Ausführliches Logging mit detaillierter Ergebnisausgabe
+Android und Windows werden in diesem Fork bewusst nicht unterstützt.
 
 ## Voraussetzungen
 
-- PowerShell 5.1 oder neuer
-- Microsoft-Graph-API-Berechtigungen:
-  - `DeviceManagementConfiguration.ReadWrite.All` (für Compliance-Richtlinien)
-  - `DeviceManagementApps.ReadWrite.All` (für App-Protection-Richtlinien)
-  - `WindowsUpdates.ReadWrite.All` (für Windows-Update-Catalog-Abfragen — nur nötig bei Windows-Automatisierung)
-- Für Managed-Identity-Authentifizierung: Modul `Az.Accounts` (in Azure Automation i. d. R. vorinstalliert)
-- Für Key-Vault-Integration: Modul `Az.KeyVault` und entsprechender Key-Vault-Zugriff
-- Für Zertifikats-Authentifizierung: Zertifikat im Speicher `Cert:\CurrentUser\My` (privater Schlüssel erforderlich); **keine externe Assembly nötig** — der JWT wird mit eingebauter .NET-Kryptografie erstellt (lokaler Fix)
+- PowerShell 5.1 oder neuer (Windows PowerShell oder PowerShell 7)
+- Eine Entra-ID-App-Registrierung (oder eine Azure-Automation-Managed-Identity) mit folgenden **Anwendungsberechtigungen** (mit Admin-Zustimmung) für Microsoft Graph:
+
+| Berechtigung | Wofür benötigt |
+|---|---|
+| `DeviceManagementConfiguration.ReadWrite.All` | Lesen/Schreiben von Compliance-Richtlinien |
+| `DeviceManagementApps.ReadWrite.All` | Lesen/Schreiben von App-Protection-Richtlinien |
+| `DeviceManagementManagedDevices.Read.All` | Lesen der installierten OS-Version pro Gerät (Block 2) |
+| `Mail.Send` | Versand der Benachrichtigungs-E-Mails (nur Block 3) |
+| `User.Read.All` | Ermitteln der echten primären SMTP-Adresse des Geräte-Besitzers (nur Block 3) |
+
+Bei Verwendung von `Mail.Send` die App-Registrierung unbedingt per Exchange-Online-**Application-Access-Policy** auf ein einziges Sende-Postfach beschränken — sonst kann die App als **jedes beliebige** Postfach im Tenant senden:
+
+```powershell
+New-ApplicationAccessPolicy -AppId "<client-id>" `
+    -PolicyScopeGroupId "intune-automation@eurefirma.de" `
+    -AccessRight RestrictAccess `
+    -Description "Nur Automatisierungs-Postfach erlauben"
+```
+
+Für die Zertifikats-Authentifizierung muss das Zertifikat samt privatem Schlüssel in `Cert:\CurrentUser\My` liegen — und zwar im Profil des Windows-Kontos, unter dem das Skript tatsächlich läuft (Vorsicht bei geplanten Aufgaben unter einem Dienstkonto).
 
 ## Konfiguration
 
-### Authentifizierungseinstellungen
+### Authentifizierung
 
-#### Managed Identity
 ```powershell
-$AuthMode = "ManagedIdentity"
-$TenantId = "deine-tenant-id"
-$UserAssignedClientId = "" # optional
+# ManagedIdentity | AppRegCert | AppRegSecret
+$AuthMode              = "AppRegCert"
+$TenantId              = "<tenant-id>"
+$ClientId              = "<client-id>"
+$CertThumbprint        = "<thumbprint>"          # nur AppRegCert
+$ClientSecret          = "<secret>"              # nur AppRegSecret
+$UserAssignedClientId  = ""                      # ManagedIdentity, optional
+$KeyVaultName          = ""                      # AppRegSecret, optional
+$KeyVaultSecretName    = ""                       # AppRegSecret, optional
 ```
 
-#### App-Registrierung mit Zertifikat
-```powershell
-$AuthMode = "AppRegCert"
-$TenantId = "deine-tenant-id"
-$ClientId = "deine-client-id"
-$CertThumbprint = "zertifikat-thumbprint"
-```
-
-#### App-Registrierung mit Secret
-```powershell
-$AuthMode = "AppRegSecret"
-$TenantId = "deine-tenant-id"
-$ClientId = "deine-client-id"
-$ClientSecret = "dein-secret"
-
-# Optional: Key Vault nutzen
-$KeyVaultName = "dein-keyvault-name"
-$KeyVaultSecretName = "dein-secret-name"
-```
-
-### Umgebungskonfiguration
+### Richtlinien und Cadence
 
 ```powershell
-$CadenceDays = 14
+# Cadence für Compliance + App-Protection "Zugriff blockieren"
+$CadenceDays        = 30
+# Cadence für App-Protection "Warnung" — üblicherweise kürzer, damit Benutzer rechtzeitig
+# vor der strengeren Block-Frist gewarnt werden. Gilt nicht für Compliance-Richtlinien
+# (dort gibt es kein separates Warn-Feld).
+$CadenceDaysWarning = 14
 
-$CompliancePolicies = @{
-  iOS     = @("policy-guid-1", "policy-guid-2")
-  iPadOS  = @("policy-guid-3")
-  macOS   = @()
-  Android = @("policy-guid-4")
-  Windows = @("policy-guid-5")
-}
+$CompliancePolicies = @{ iOS = @(); iPadOS = @(); macOS = @() }
+$AppProtectionPolicies = @{ iOS = @(); iPadOS = @() }
 
-$AppProtectionPolicies = @{
-  iOS     = @("policy-guid-6")
-  iPadOS  = @()
-  Android = @("policy-guid-7")
-  Windows = @("policy-guid-8")
-}
-```
-
-### Sicherheitseinstellungen
-
-```powershell
 $AllowDowngrade = $false
 $DryRun         = $true
-$ForceApply     = $false
+$ForceApply     = $false   # umgeht die Cadence, gilt für Warn- und Block-Frist gleichermaßen
 ```
 
-## Verwendung
+### Block-Schalter
 
-1. Authentifizierung und Policy-IDs im Skript konfigurieren
-2. Zuerst mit `$DryRun = $true` ausführen und die Ausgabe prüfen
-3. Für den produktiven Lauf `$DryRun = $false` setzen
+```powershell
+$RunPolicyMaintenance = $true
 
-Auch mit `$DryRun = $false` wird nichts geändert, solange das `EffectiveDate` (Release-Datum + `$CadenceDays`) noch nicht erreicht ist — für einen Test vor diesem Datum kann `$ForceApply = $true` vorübergehend gesetzt werden; danach für den produktiven Betrieb wieder auf `$false` zurückstellen.
+$CheckDeviceCompliance             = $false
+$CompareAgainstLatestPublicVersion = $false   # Fallback auf aktuelle öffentliche Version, falls Policy keine Mindestversion hat
+$ShowDeviceComplianceList          = $false   # Geräte-Tabelle zusätzlich auf der Konsole ausgeben
+$DeviceComplianceReportPath        = "C:\Reports"
 
-## Ausgabe
-
-```
-[RESULT][iOS/Compliance]    test:     action=NotEffectiveYet; currentRequired=23.5; target=26.5.2; ...
-[RESULT][iOS/AppProtection] test_123: action=NotEffectiveYet; currentRequired=23.4; currentWarning=22.4; target=26.5.2; ...
-
-Platform Type          Setting        Name     CurrentRequired CurrentWarning Target ... Action          ...
--------- ----          -------        ----     --------------- -------------- ------ --- ------          ---
-iOS      Compliance    MinimumVersion test     23.5                           26.5.2 ... NotEffectiveYet ...
-iOS      AppProtection MinimumVersion test_123 23.4            22.4           26.5.2 ... NotEffectiveYet ...
+$SendUserNotificationEmail = $false           # setzt $CheckDeviceCompliance = $true voraus
+$EmailSenderAddress        = "<sender-postfach@euretenant.onmicrosoft.com>"
 ```
 
-## Aktionstypen
+## Funktionsweise
 
-- **Updated**: Richtlinie wurde erfolgreich aktualisiert
-- **WouldUpdate**: Richtlinie würde aktualisiert (Dry-Run-Modus)
-- **Skipped**: Aktueller Wert/aktuelle Werte erfüllen bereits das Ziel (Downgrade-Schutz)
-- **NotEffectiveYet**: Cadence-Zeitraum ist noch nicht abgelaufen
-- **NoData**: Keine Versionsdaten verfügbar (bzw. bei App Protection: weder `minimumRequiredOsVersion` noch `minimumWarningOsVersion` auf der Richtlinie konfiguriert)
-- **Error**: Update fehlgeschlagen (Details in der Ausgabe)
+### Block 1 — Policy Maintenance
 
-## Sicherheitshinweise
+Für jede konfigurierte Plattform ruft das Skript die neueste OS-Version samt Release-Datum von endoflife.date ab und berechnet daraus zwei unabhängige Fristen:
 
-- Secrets bei Verwendung von `AppRegSecret` in Azure Key Vault speichern
-- Für Szenarien außerhalb von Azure Automation Zertifikats-Authentifizierung gegenüber Secrets bevorzugen (längere Gültigkeit, privater Schlüssel verlässt die Maschine nie)
-- Für Azure-Automation-Szenarien Managed Identity verwenden
-- Least-Privilege-Prinzip bei den Graph-API-Berechtigungen anwenden
-- Audit-Logs auf Richtlinienänderungen prüfen
-- Zuerst in einer Nicht-Produktivumgebung testen
+- `WarningEffectiveDate = ReleaseDate + $CadenceDaysWarning`
+- `RequiredEffectiveDate = ReleaseDate + $CadenceDays`
 
-## Lizenz
+Die Felder `minimumWarningOsVersion` (Warn) und `minimumRequiredOsVersion` (Block) jeder App-Protection-Richtlinie werden dann **unabhängig voneinander** gegen ihre jeweilige Frist geprüft. Es kann also vorkommen, dass in einem Lauf nur das Warn-Feld aktualisiert wird, während Block noch nicht fällig ist — das ist so gewollt und erscheint als `Updated (nur Warn - Block noch nicht faellig)` (oder umgekehrt) statt eines einfachen `Updated`. Es werden nur Felder angefasst, die in der Richtlinie bereits konfiguriert sind — das Skript schaltet nie Block zu, wo bisher nur Warn existierte, oder umgekehrt.
 
-Nutzung auf eigenes Risiko. Vor dem produktiven Einsatz gründlich prüfen und testen.
+Compliance-Richtlinien haben nur das eine Feld `osMinimumVersion` und nutzen ausschließlich `$CadenceDays`.
+
+### Block 2 — Device Compliance Report
+
+- **Compliance-Richtlinien**: nutzt den dokumentierten Graph-Endpunkt `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` für die Geräteliste und korreliert jeden Eintrag über die ID mit `/deviceManagement/managedDevices/{id}` für installierte OS-Version, Gerätemodell und letzten Sync-Zeitpunkt. Diese ID-Korrelation ist ein in der Community verbreitetes, von Microsoft aber nicht explizit dokumentiertes Muster — bei Auffälligkeiten in Graph Explorer verifizieren.
+- **App-Protection-Richtlinien**: der einfache Endpunkt für den Gerätestatus pro Richtlinie ist nicht zuverlässig über alle Tenants hinweg verfügbar. Stattdessen nutzt das Skript die asynchrone **Intune-Reports-Export-API** (`/deviceManagement/reports/exportJobs`, Report `MAMAppProtectionStatus`): Export-Job anlegen, auf Fertigstellung warten, ZIP herunterladen, entpacken, auswerten. Obwohl Microsofts eigene Doku für diesen Report "keine Filter" angibt, enthält er tatsächlich eine `Policy`-Spalte mit dem Anzeigenamen der Richtlinie — darüber ordnet das Skript die Zeilen der richtigen Richtlinie zu.
+- Ausgabe: `IntuneDeviceComplianceReport_<Zeitstempel>.csv` und eine passende `.html`-Datei mit klickbaren, sortierbaren Spalten, einer Filterzeile pro Spalte, und rot markierten nicht-konformen Zeilen — komplett eigenständig (kein externes JS/CSS, funktioniert offline).
+
+### Block 3 — User Notification Email
+
+Nutzt die Geräteliste aus Block 2, filtert auf `Compliant = "No"`-Zeilen mit auflösbarem Benutzer, ermittelt für jeden Benutzer die echte primäre SMTP-Adresse über `/users/{upn}` (Fallback auf die UPN, falls die Abfrage fehlschlägt — UPN und primäre E-Mail-Adresse sind nicht immer identisch, z. B. bei einem lokalen `.local`-UPN-Suffix), und verschickt eine individuelle E-Mail pro Gerät über `/users/{sender}/sendMail`. Die im Text genannte Frist (`$CadenceDays` vs. `$CadenceDaysWarning`) passt sich automatisch der auslösenden Regel (Warn oder Block) an.
+
+## Bekannte Einschränkungen
+
+- Das Schema des `MAMAppProtectionStatus`-Reports wurde empirisch ermittelt (Microsofts öffentliche Doku listet keine exakten Spaltennamen) — falls euer Tenant andere Spaltennamen liefert, findet die stichwortbasierte Suche des Skripts (`Get-PropertyValueLike`) das erwartete Feld eventuell nicht. Bei leeren Gerätedaten die `[INFO]`-Diagnosezeilen prüfen (Zeilenanzahl des Reports, Spaltennamen, "kein Treffer"-Warnungen).
+- Apple-Gerätemodell-Werte (z. B. `iPhone12,1`) sind Apples interne Kennungen, keine lesbaren Namen — es gibt keine offizielle API, die das auf Marketingnamen (z. B. "iPhone 11") abbildet.
+- Windows PowerShell 5.1 dekodiert bei `Invoke-RestMethod`/`Invoke-WebRequest` UTF-8-JSON-Antworten ohne expliziten Charset fälschlich als ISO-8859-1 (verfälscht deutsche Umlaute/ß). Umgangen über einen auf rohem `HttpWebRequest` basierenden `Invoke-GraphGet`-Wrapper für GET-Aufrufe. Sieht ein Anzeigename auch unter PowerShell 7 (das diesen Bug nicht hat) noch falsch aus, ist der Wert höchstwahrscheinlich tatsächlich im gespeicherten Intune-Objekt selbst beschädigt (z. B. durch ein früheres Tool mit demselben Bug) — direkt im Intune-Portal prüfen.
+
+## Fehlerbehebung
+
+**"Unable to find type [System.IdentityModel.Tokens.Jwt.JwtSecurityTokenHandler]"** — betrifft nur das *ursprüngliche* Upstream-Skript; dieser Fork baut die JWT-Client-Assertion manuell mit eingebauter .NET-Kryptografie (`System.Security.Cryptography`), keine externe Assembly nötig.
+
+**"AADSTS7000215: Invalid client secret provided"** — ihr habt die Secret-**ID** (eine reine GUID) statt des Secret-**Werts** aus Entra ID → Zertifikate & Geheimnisse eingetragen. Der Wert wird nur einmal direkt nach dem Erstellen angezeigt.
+
+**Zertifikat nicht gefunden** — muss in `Cert:\CurrentUser\My` des Kontos liegen, unter dem das Skript tatsächlich läuft (nicht `Cert:\LocalMachine\My`), samt privatem Schlüssel.
+
+## Änderungsprotokoll gegenüber dem Original
+
+- Android- und Windows-Support komplett entfernt (nur noch iOS/iPadOS/macOS)
+- Unterstützung für das App-Protection-Feld "Warnung" (`minimumWarningOsVersion`) ergänzt, unabhängig von "Zugriff blockieren" (`minimumRequiredOsVersion`) — vorher wurde nur Block gelesen/geschrieben
+- Getrennte Cadence-Zeiten: eigene, kürzere Frist für Warn vs. Block
+- `Current` → `CurrentRequired` umbenannt zur Klarstellung, jetzt wo auch `CurrentWarning` existiert
+- `AppRegCert`-Authentifizierung repariert: ohne Abhängigkeit von `System.IdentityModel.Tokens.Jwt` neu aufgebaut
+- Redundanten doppelten API-Aufruf an endoflife.date für die App-Protection-Cadence-Prüfung behoben (nutzt jetzt das Ergebnis der Compliance-Prüfung wieder)
+- UTF-8-Verfälschung unter Windows PowerShell 5.1 über einen eigenen `Invoke-GraphGet`-Wrapper behoben
+- Geräteweise Compliance-Berichterstattung ergänzt (Block 2), inkl. CSV- und filterbarer/sortierbarer HTML-Ausgabe, Gerätemodell und letztem Sync-Zeitpunkt
+- Individuelle E-Mail-Benachrichtigung pro Benutzer für nicht-konforme Geräte ergänzt (Block 3), vollständig `$DryRun`-sicher
+- Prioritäts-Bug bei der Eigenschaftssuche behoben, der beim Aufbau der Benachrichtigungsempfänger einen Anzeigenamen statt einer E-Mail-Adresse hätte auswählen können
 
 ## Haftungsausschluss
 
-Dieses Skript verändert produktive Intune-Richtlinien. Immer zuerst in einer Nicht-Produktivumgebung testen und vor dem Live-Einsatz den Dry-Run-Modus nutzen. Weder der Original-Autor noch der Autor dieser lokalen Fixes übernimmt Haftung für unbeabsichtigte Änderungen oder Auswirkungen auf deine Umgebung.
+Dieses Skript verändert produktive Intune-Richtlinien und kann im Namen eurer Organisation E-Mails versenden. Immer zuerst mit `$DryRun = $true` testen, nach Möglichkeit in einer Nicht-Produktivumgebung. Weder der ursprüngliche Upstream-Autor noch FP-IT-Solutions GmbH übernimmt Haftung für unbeabsichtigte Änderungen oder Auswirkungen auf eure Umgebung.
