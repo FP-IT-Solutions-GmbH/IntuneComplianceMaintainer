@@ -44,7 +44,9 @@ New-ApplicationAccessPolicy -AppId "<client-id>" `
     -Description "Restrict to the automation mailbox"
 ```
 
-For certificate authentication, the certificate must be installed with its private key in `Cert:\CurrentUser\My` — of whichever Windows account actually runs the script (careful with scheduled tasks running under a service account).
+For certificate authentication, the certificate must be installed with its private key in `Cert:\CurrentUser\My` of the account that runs the script, or in `Cert:\LocalMachine\My` (the script looks in both, in this order). The machine store is the easiest option when the script runs as SYSTEM; the running account needs read access to the private key.
+
+For an Azure Automation managed identity, `Grant-ManagedIdentityGraphPermissions.ps1` assigns these permissions. It grants `Mail.Send` and `User.Read.All` only with `-IncludeMailPermissions`.
 
 ## Configuration
 
@@ -88,14 +90,21 @@ $VersionStateFilePath = "C:\Skripte\IntuneComplianceMaintainer-VersionState.json
 ```powershell
 $RunPolicyMaintenance = $true
 
-$CheckDeviceCompliance             = $false
+$CheckDeviceCompliance             = $true
 $CompareAgainstLatestPublicVersion = $false   # fallback to latest public OS version if a policy has no minimum configured
-$ShowDeviceComplianceList          = $false   # also print the device table to console
+$ShowDeviceComplianceList          = $true    # also print the device table to console
 $DeviceComplianceReportPath        = "C:\Reports"
 
 $SendUserNotificationEmail = $false           # requires $CheckDeviceCompliance = $true
 $EmailSenderAddress        = "<sender-mailbox@yourtenant.onmicrosoft.com>"
+$MaxNotificationsPerRun    = 50               # safety limit: above this, Block 3 sends nothing and logs an error
 ```
+
+### Logging and exit code
+
+`$VerboseLogging = $true` shows all `INFO` lines. `WARN` and `ERROR` lines are always shown, also with `$VerboseLogging = $false`.
+
+At the end the script prints a `[SUMMARY]` line (policies, device rows, emails, errors). If anything failed — a policy row with `Action = Error`, a device row with `Compliant = Error: ...`, a failed email or a logged `ERROR` — it ends with **exit code 1**, so a scheduled task or runbook job shows the run as failed.
 
 ## How it works
 
@@ -114,15 +123,29 @@ Each App Protection policy's `minimumWarningOsVersion` (Warn) and `minimumRequir
 
 Compliance policies only have the single `osMinimumVersion` field and use `$CadenceDays` only.
 
+**Safeguards in Block 1:**
+
+- The data from endoflife.date is validated before use: the version must look like a version number (e.g. `26.1` or `26.1.2`), and the release date must not lie in the future. A jump of more than one major version compared to the tracked version is refused, and the target version never moves backwards. If the check fails, no policy of that platform is changed and the policies get an `Error` row. If a new major version really is correct, delete the platform's entry in the state file.
+- Before writing a Compliance policy, its type is checked (`iosCompliancePolicy` for iOS/iPadOS, `macOSCompliancePolicy` for macOS). A policy of another platform, e.g. a Windows policy ID entered by mistake, is never written to.
+- Every policy is processed on its own: a deleted policy, a wrong ID or a missing permission gives an `Error` row for that policy, and the run continues with the next policy, platform and Blocks 2/3.
+- Version numbers are compared after normalization (see Block 2), so values like `17` or `26.1.0` don't break the comparison. An equal value is always `Skipped`, also with `$AllowDowngrade = $true`.
+- Graph calls are retried only on transient errors (network, 408, 429, 5xx), honouring `Retry-After`. Other errors such as 404 fail immediately. The Graph token is renewed automatically after 45 minutes.
+
 ### Block 2 — Device Compliance Report
 
-- **Compliance policies**: uses the documented Graph endpoint `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` for the device list, then correlates each entry by ID to `/deviceManagement/managedDevices/{id}` for the installed OS version, device model, and last sync time. This ID correlation is a widely used community pattern, not explicitly documented by Microsoft — verify in Graph Explorer if results look off for your tenant.
-- **App Protection policies**: the simple per-policy device-status endpoint is not reliably available across tenants. Instead, this uses the asynchronous **Intune Reports export API** (`/deviceManagement/reports/exportJobs`, report `MAMAppProtectionStatus`): create the export job, poll until complete, download the ZIP, extract, and parse. Despite Microsoft's own documentation stating this report has "no filters," it does include a `Policy` column with the policy's display name, which the script uses to attribute rows to the correct policy.
-- Output: `IntuneDeviceComplianceReport_<timestamp>.csv` and a matching `.html` file with click-to-sort columns, a per-column text filter row, and non-compliant rows highlighted in red — fully self-contained (no external JS/CSS, works offline).
+- **Compliance policies**: uses the documented Graph endpoint `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` for the device list (all pages, following `@odata.nextLink`), then correlates each entry by ID to `/deviceManagement/managedDevices/{id}` for the installed OS version, device model, and last sync time. This ID correlation is a widely used community pattern, not explicitly documented by Microsoft — verify in Graph Explorer if results look off for your tenant. If the lookup fails for a device, it is shown as `Unknown (device lookup failed)` and a `WARN` line gives the count.
+- **App Protection policies**: the simple per-policy device-status endpoint is not reliably available across tenants. Instead, this uses the asynchronous **Intune Reports export API** (`/deviceManagement/reports/exportJobs`, report `MAMAppProtectionStatus`): create the export job, poll until complete, download the ZIP, extract, and parse. Despite Microsoft's own documentation stating this report has "no filters," it does include a `Policy` column with the policy's display name, which the script uses to attribute rows to the correct policy. If a policy has both Block and Warn configured, **both** are checked per device: a device below Block is reported against Block, a device that passes Block but is below Warn is reported against Warn (`RuleType = AppProtection-Warn`).
+- **Version comparison**: the first dot-separated number in a version string is used and padded to four parts, so `14.1 (23B74)` (macOS with build) is read as 14.1, `26.5.2.a` (Rapid Security Response) as 26.5.2, and `18.5` equals `18.5.0`.
+- Output: `IntuneDeviceComplianceReport_<timestamp>.csv` and a matching `.html` file with click-to-sort columns (version numbers and dates sort correctly), a per-column text filter row, and non-compliant rows highlighted in red — fully self-contained (no external JS/CSS, works offline). In the CSV, values starting with `=`, `+`, `-` or `@` get a leading `'`, so Excel does not run them as formulas.
 
 ### Block 3 — User Notification Email
 
-Reuses Block 2's device list, filters to `Compliant = "No"` rows with a resolvable user, looks up each user's real primary SMTP address via `/users/{upn}` (falls back to the UPN if the lookup fails — UPN and primary email are not always the same, e.g. with an on-prem `.local` UPN suffix), and sends one individual email per device via `/users/{sender}/sendMail`. The email's stated deadline (`$CadenceDays` vs. `$CadenceDaysWarning`) automatically matches whichever rule (Warn or Block) triggered the notification.
+Reuses Block 2's device list, filters to `Compliant = "No"` rows with a resolvable user, looks up each user's real primary SMTP address via `/users/{upn}` (falls back to the UPN if the lookup fails — UPN and primary email are not always the same, e.g. with an on-prem `.local` UPN suffix), and sends one individual email per device via `/users/{sender}/sendMail`.
+
+- **One email per device:** rows are grouped by user and device first (the App Protection report has one row per app, and a device can also appear under a Compliance policy). The most serious finding is sent: Block/Compliance before Warn, then the highest required version.
+- **Content:** subject and update path match the platform (iPhone/iPad or Mac). Because devices are compared against the version that is *currently* configured, the email describes the current state (access blocked / warning shown / device non-compliant) and does not promise a grace period.
+- **Safety limit:** if more than `$MaxNotificationsPerRun` devices would be notified, no email is sent at all and an `ERROR` is logged — protection against a mass mailing caused by a wrong target version.
+- `sendMail` is only retried on 429/503, so a timeout cannot lead to the same email being sent twice. The email is sent as UTF-8, so umlauts arrive correctly also under Windows PowerShell 5.1.
 
 ## Running unattended (Scheduled Task)
 
@@ -134,7 +157,9 @@ Two helper scripts are included for running the main script daily on a Windows s
   ```
 - **`Invoke-IntuneComplianceMaintainerWithLogging.ps1`** — the wrapper the task actually calls. It runs the main script, writes all of its output to `IntuneComplianceMaintainer_<timestamp>.log` in `-LogDirectory`, deletes logs older than `-RetentionDays` (default 30), and exits with code 1 if the main script threw.
 
-**Running as SYSTEM:** `SYSTEM` has its own certificate store. A certificate you imported under your own account is not visible to it. Use `AppRegSecret` (preferably from Key Vault), or import the certificate into the SYSTEM account's `Cert:\CurrentUser\My`. If the secret is entered directly in the script, restrict the script file's permissions to Administrators and SYSTEM — by default, files under `C:\` are readable by all local users.
+The wrapper writes the log as UTF-8 and reports a run as `Failed` (exit code 1) both when the main script throws and when it ends with exit code 1 (see "Logging and exit code").
+
+**Running as SYSTEM:** `SYSTEM` has its own certificate store. A certificate you imported under your own account is not visible to it. Use `AppRegCert` with the certificate in `Cert:\LocalMachine\My`, or `AppRegSecret` (preferably from Key Vault). If the secret is entered directly in the script, restrict the script file's permissions to Administrators and SYSTEM — by default, files under `C:\` are readable by all local users.
 
 ## Known limitations
 
@@ -148,7 +173,9 @@ Two helper scripts are included for running the main script daily on a Windows s
 
 **"AADSTS7000215: Invalid client secret provided"** — you've entered the Secret **ID** (a plain GUID) instead of the Secret **Value** from Entra ID → Certificates & secrets. The value is only shown once, right after creating the secret.
 
-**Certificate not found** — must be in `Cert:\CurrentUser\My` of the account actually running the script (not `Cert:\LocalMachine\My`), with its private key.
+**Certificate not found** — must be in `Cert:\CurrentUser\My` of the account actually running the script or in `Cert:\LocalMachine\My`, with its private key, and the running account must be allowed to read that private key.
+
+**Run shows `Failed` / exit code 1** — check the `[SUMMARY]` line and the `ERROR`/`WARN` lines in the log; every failed policy, device lookup or email is listed there.
 
 ## Changelog vs. upstream
 
@@ -164,6 +191,7 @@ Two helper scripts are included for running the main script daily on a Windows s
 - Fixed a property-lookup priority bug that could pick a display name instead of an email address when building notification recipients
 - Added persistent version tracking (`$VersionStateFilePath`): a superseded target version is promoted to the Warn target instead of being skipped, so Warn keeps advancing during periods of frequent releases
 - Added `Setup-IntuneComplianceMaintainerTask.ps1` and the logging wrapper `Invoke-IntuneComplianceMaintainerWithLogging.ps1` for unattended daily runs
+- Hardening after code review (2026-11): endoflife.date data validated; Compliance policy type checked before writing; errors per policy instead of aborting the run; robust version comparison (macOS build suffix, `18.5` = `18.5.0`, single-number versions); paging for device statuses; Block and Warn both evaluated per device; one email per device with a safety limit and a text that matches the current state; UTF-8 email body; retries only on transient errors; token renewal; exit code 1 on errors; certificate also from `LocalMachine\My`; temp files of the report export always removed; CSV formula protection; least-privilege defaults in the grant script
 
 ## Disclaimer
 

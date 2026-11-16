@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Maintains Intune Compliance and App Protection minimum-OS-version settings for Apple platforms
   (iOS, iPadOS, macOS), based on endoflife.date data, and reports/notifies on device-level
@@ -127,12 +127,25 @@ $SendUserNotificationEmail = $false
 # send as (see Mail.Send permission + Exchange Online Application Access Policy in the README).
 $EmailSenderAddress = "<sender-mailbox@yourtenant.onmicrosoft.com>"
 
+# Safety limit: if more devices than this would be notified in one run, Block 3 sends nothing
+# at all and logs an error instead. Protects against a mass mailing caused by a wrong target
+# version or a misconfiguration. Raise it deliberately if your environment really needs more.
+$MaxNotificationsPerRun = 50
+
 # --------------------------- Script Variables ---------------------------
 # Platform slugs (endoflife.date API product names)
 $EolProducts = @{
   iOS     = "iOS"
   iPadOS  = "iPadOS"
   macOS   = "macOS"
+}
+
+# Expected Graph @odata.type of a Compliance policy per platform. Block 1 refuses to write
+# into a policy of a different type (protects against a wrong policy ID in the config).
+$CompliancePolicyTypes = @{
+  iOS     = "#microsoft.graph.iosCompliancePolicy"
+  iPadOS  = "#microsoft.graph.iosCompliancePolicy"
+  macOS   = "#microsoft.graph.macOSCompliancePolicy"
 }
 
 # Retry policy
@@ -176,9 +189,16 @@ function Get-GraphToken {
       # System.IdentityModel.Tokens.Jwt assembly, which is not loaded by default in
       # Windows PowerShell 5.1 and whose newer NuGet versions no longer expose
       # X509SigningCredentials.
-      $cert = Get-Item "Cert:\CurrentUser\My\$CertThumbprint" -ErrorAction Stop
-      if (-not $cert.HasPrivateKey) {
-        throw "Certificate $CertThumbprint was found but has no private key, or is not present in Cert:\CurrentUser\My."
+      # Look in the running account's own store first, then in the machine store. The machine
+      # store matters when the script runs as SYSTEM (e.g. as a scheduled task): SYSTEM has its
+      # own, usually empty, CurrentUser store.
+      $cert = $null
+      foreach ($store in @("Cert:\CurrentUser\My", "Cert:\LocalMachine\My")) {
+        $candidate = Get-Item "$store\$CertThumbprint" -ErrorAction SilentlyContinue
+        if ($candidate -and $candidate.HasPrivateKey) { $cert = $candidate; break }
+      }
+      if (-not $cert) {
+        throw "Certificate $CertThumbprint with private key not found in Cert:\CurrentUser\My or Cert:\LocalMachine\My (or the running account cannot access its private key)."
       }
 
       function script:ConvertTo-Base64UrlInternal([byte[]]$Bytes) {
@@ -225,7 +245,15 @@ function Get-GraphToken {
     }
     "AppRegSecret" {
       if ($KeyVaultName -and $KeyVaultSecretName) {
-        $ClientSecret = (Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $KeyVaultSecretName -AsPlainText)
+        # Get-AzKeyVaultSecret needs an Az session. Reuse an existing one (e.g. Connect-AzAccount
+        # done beforehand), otherwise sign in with the managed identity of the Automation
+        # Account / VM.
+        if (-not (Get-AzContext -ErrorAction SilentlyContinue)) {
+          $connectParams = @{ Identity = $true; ErrorAction = 'Stop' }
+          if ($UserAssignedClientId) { $connectParams["AccountId"] = $UserAssignedClientId }
+          $null = Connect-AzAccount @connectParams
+        }
+        $ClientSecret = (Get-AzKeyVaultSecret -VaultName $KeyVaultName -Name $KeyVaultSecretName -AsPlainText -ErrorAction Stop)
       }
       $body = @{
         client_id     = $ClientId
@@ -240,13 +268,62 @@ function Get-GraphToken {
   return $token
 }
 
+function Get-HttpErrorInfo {
+  # Extracts the HTTP status code and a Retry-After delay (seconds) from an error record, for
+  # Windows PowerShell 5.1 (WebException), PowerShell 7 (HttpResponseException) and the
+  # exceptions thrown by Invoke-GraphGet (status code in Exception.Data). Values are $null when
+  # unknown, e.g. for network errors without any HTTP response.
+  param($ErrorRecord)
+  $ex = $ErrorRecord.Exception
+  $status = $null
+  $retryAfter = $null
+  if ($ex.Data -and $ex.Data.Contains("StatusCode")) { $status = [int]$ex.Data["StatusCode"] }
+  if ($ex.Data -and $ex.Data.Contains("RetryAfter")) { $retryAfter = $ex.Data["RetryAfter"] }
+  if (-not $status -and $ex.Response) {
+    try { $status = [int]$ex.Response.StatusCode } catch { }
+    try {
+      if ($ex.Response.Headers.RetryAfter -and $ex.Response.Headers.RetryAfter.Delta) {
+        $retryAfter = [int]$ex.Response.Headers.RetryAfter.Delta.TotalSeconds
+      } elseif ($ex.Response.Headers -and $ex.Response.Headers["Retry-After"]) {
+        $retryAfter = [int]$ex.Response.Headers["Retry-After"]
+      }
+    } catch { }
+  }
+  return [pscustomobject]@{ StatusCode = $status; RetryAfterSeconds = $retryAfter }
+}
+
+function Update-GraphTokenIfNeeded {
+  # Graph tokens are valid for roughly 60-90 minutes. Long runs (large tenants, slow report
+  # exports) would otherwise fail with 401 halfway through. Re-acquires the token after 45
+  # minutes; returns the token to use.
+  param([string]$CurrentToken)
+  if ($script:TokenAcquiredAt -and ((Get-Date) - $script:TokenAcquiredAt).TotalMinutes -lt 45) { return $CurrentToken }
+  Write-Log "Refreshing Graph token (older than 45 minutes)" "INFO"
+  $newToken = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -AuthMode $AuthMode -CertThumbprint $CertThumbprint -ClientSecret $ClientSecret
+  if (-not $newToken) { throw "Token refresh returned an empty token." }
+  $script:TokenAcquiredAt = Get-Date
+  return $newToken
+}
+
 function Invoke-WithRetry {
-  param([scriptblock]$Script,[int]$RetryCount,[int]$DelaySeconds)
+  # Retries transient failures only: network errors without a response, 408, 429 and 5xx.
+  # Other 4xx errors (400/403/404 ...) fail immediately - retrying them cannot help and only
+  # delays the run. Waits for Retry-After if the server sends it, otherwise backs off
+  # exponentially ($DelaySeconds, 2x, 4x ...).
+  # -ThrottleOnly: retry only on 429/503, where the server definitely did not process the
+  # request. Used for non-idempotent calls like sendMail, where a retry after a timeout could
+  # send the same email twice.
+  param([scriptblock]$Script,[int]$RetryCount,[int]$DelaySeconds,[switch]$ThrottleOnly)
   for ($i=0; $i -le $RetryCount; $i++) {
     try { return & $Script }
     catch {
-      if ($i -eq $RetryCount) { throw }
-      Start-Sleep -Seconds $DelaySeconds
+      $info = Get-HttpErrorInfo $_
+      $code = $info.StatusCode
+      $transient = if ($ThrottleOnly) { $code -in 429, 503 } else { (-not $code) -or $code -in 408, 429 -or $code -ge 500 }
+      if ($i -eq $RetryCount -or -not $transient) { throw }
+      $wait = if ($info.RetryAfterSeconds) { [math]::Min([int]$info.RetryAfterSeconds, 120) } else { $DelaySeconds * [math]::Pow(2, $i) }
+      Write-Log "Transient error (HTTP $(if ($code) { $code } else { 'n/a' })), retry $($i + 1)/$RetryCount in $wait s: $($_.Exception.Message)" "WARN"
+      Start-Sleep -Seconds $wait
     }
   }
 }
@@ -278,12 +355,21 @@ function Invoke-GraphGet {
   try {
     $response = $request.GetResponse()
   } catch [System.Net.WebException] {
-    if ($_.Exception.Response) {
-      $errStream = $_.Exception.Response.GetResponseStream()
+    $errResponse = $_.Exception.Response
+    if ($errResponse) {
+      $errStream = $errResponse.GetResponseStream()
       $errReader = New-Object System.IO.StreamReader($errStream, [System.Text.Encoding]::UTF8)
       $errBody = $errReader.ReadToEnd()
       $errReader.Close()
-      throw "Graph GET $Uri failed: $errBody"
+      # Keep the status code (and Retry-After) on the exception so Invoke-WithRetry can tell
+      # transient errors (429/5xx) from permanent ones (404 ...).
+      $statusCode = [int]$errResponse.StatusCode
+      $ex = New-Object System.Exception("Graph GET $Uri failed (HTTP $statusCode): $errBody")
+      $ex.Data["StatusCode"] = $statusCode
+      $retryAfterHeader = $errResponse.Headers["Retry-After"]
+      if ($retryAfterHeader -match '^\d+$') { $ex.Data["RetryAfter"] = [int]$retryAfterHeader }
+      $errResponse.Close()
+      throw $ex
     }
     throw
   }
@@ -297,11 +383,44 @@ function Invoke-GraphGet {
   return $json | ConvertFrom-Json
 }
 
+function Invoke-GraphGetAll {
+  # GETs a Graph collection and follows @odata.nextLink until all pages are read. Graph returns
+  # large collections in pages; reading only ".value" of the first response silently drops
+  # everything after page one.
+  param([string]$Uri,[hashtable]$Headers)
+  $items = New-Object System.Collections.Generic.List[object]
+  $next = $Uri
+  $pages = 0
+  while ($next) {
+    $pageUri = $next
+    $page = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $pageUri -Headers $Headers }
+    foreach ($item in @($page.value)) { if ($null -ne $item) { $items.Add($item) } }
+    $next = $page.'@odata.nextLink'
+    $pages++
+    if ($pages -ge 1000) { throw "Paging aborted after 1000 pages for $Uri" }
+  }
+  return ,$items.ToArray()
+}
+
+$script:LoggedErrorCount = 0
+
 function Write-Log {
-  param([string]$Message,[string]$Level="INFO")
-  if (-not $VerboseLogging) { return }
+  # INFO lines are only shown with $VerboseLogging. WARN and ERROR are always shown, so a
+  # problem is never hidden by turning verbose logging off. ERRORs are counted and make the
+  # script end with exit code 1 (see end of script).
+  param([string]$Message,[ValidateSet("INFO","WARN","ERROR")][string]$Level="INFO")
+  if ($Level -eq "ERROR") { $script:LoggedErrorCount++ }
+  if ($Level -eq "INFO" -and -not $VerboseLogging) { return }
   $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
   Write-Host "[$ts][$Level] $Message"
+}
+
+function Get-ErrorText {
+  # Best available error text from a REST error record (Graph error body if present).
+  param($ErrorRecord)
+  if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) { return $ErrorRecord.ErrorDetails.Message }
+  if ($ErrorRecord.Exception.Response -and $ErrorRecord.Exception.Response.Content) { return $ErrorRecord.Exception.Response.Content }
+  return $ErrorRecord.Exception.Message
 }
 
 function Write-ResultLog {
@@ -341,26 +460,16 @@ function Get-CompliancePolicyInfo {
 }
 
 function Get-AppProtectionPolicyInfo {
-  param([string]$Token,[string]$PolicyId,[string]$Platform)
+  # Reads the same two fields Update-AppProtectionPolicy writes, so Block 1 and Block 2 always
+  # see the same values. iOS and iPadOS share the iosManagedAppProtections endpoint.
+  # (Property access in PowerShell is case-insensitive, so no spelling variants are needed.)
+  param([string]$Token,[string]$PolicyId)
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceAppManagement/iosManagedAppProtections/$PolicyId"
   $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
-  $current = $policy.minimumRequiredOsVersion
-  if (-not $current -and ($policy.PSObject.Properties.Name -contains "minimumRequiredOSVersion")) {
-    $current = $policy.minimumRequiredOSVersion
-  }
-  if (-not $current -and ($policy.PSObject.Properties.Name -contains "minimumRequiredOperatingSystem")) {
-    $current = $policy.minimumRequiredOperatingSystem
-  }
-
-  # Warning-level minimum OS version (Conditional launch action = "Warn"), independent from the
-  # Required/Block field above. A policy can have either, both, or neither configured.
-  $currentWarning = $policy.minimumWarningOsVersion
-  if (-not $currentWarning -and ($policy.PSObject.Properties.Name -contains "minimumWarningOSVersion")) {
-    $currentWarning = $policy.minimumWarningOSVersion
-  }
-
-  return [pscustomobject]@{Name=$policy.displayName;CurrentRequired=$current;CurrentWarning=$currentWarning}
+  # Block ("Zugriff blockieren") and Warn ("Warnung") minimum OS versions - a policy can have
+  # either, both, or neither configured.
+  return [pscustomobject]@{Name=$policy.displayName;CurrentRequired=$policy.minimumRequiredOsVersion;CurrentWarning=$policy.minimumWarningOsVersion}
 }
 
 function Get-VersionState {
@@ -410,11 +519,26 @@ function Resolve-CadenceTargets {
   param([hashtable]$State,[string]$Platform,[psobject]$Latest,[int]$CadenceDays,[int]$CadenceDaysWarning,[datetime]$Now,[bool]$ForceApply)
 
   $entry = $State[$Platform]
+  if ($entry) {
+    # Plausibility check against what we tracked so far: endoflife.date is a community data
+    # source, and a wrong value would be written into every policy (and never be lowered again
+    # with $AllowDowngrade = $false). A jump of more than one major version is refused.
+    $trackedMajor = [int](Convert-ToComparableVersion $entry.TargetVersion).Split('.')[0]
+    $latestMajor  = [int](Convert-ToComparableVersion $Latest.Version).Split('.')[0]
+    if ($latestMajor -gt $trackedMajor + 1) {
+      throw "Implausible version from endoflife.date for ${Platform}: $($Latest.Version) (currently tracked: $($entry.TargetVersion)). Refusing to use it. If this is correct, delete the platform's entry in '$VersionStateFilePath'."
+    }
+  }
   if (-not $entry) {
     $entry = @{ TargetVersion = $Latest.Version; TargetVersionReleaseDate = $Latest.ReleaseDate; WarningVersion = $null }
     $State[$Platform] = $entry
   }
-  elseif ($entry.TargetVersion -ne $Latest.Version) {
+  elseif ((Compare-OsVersion $Latest.Version $entry.TargetVersion) -lt 0) {
+    # endoflife.date reports an OLDER version than the one already tracked (data glitch or a
+    # pulled release). Never step backwards - keep tracking the known newer version.
+    Write-Log "Platform ${Platform}: endoflife.date reports $($Latest.Version), which is older than the tracked $($entry.TargetVersion) - keeping $($entry.TargetVersion)." "WARN"
+  }
+  elseif ((Compare-OsVersion $Latest.Version $entry.TargetVersion) -gt 0) {
     Write-Log "Platform ${Platform}: newer version detected ($($entry.TargetVersion) -> $($Latest.Version)). Promoting $($entry.TargetVersion) to the Warning target." "INFO"
     $entry.WarningVersion = $entry.TargetVersion
     $entry.TargetVersion = $Latest.Version
@@ -452,13 +576,24 @@ function Resolve-CadenceTargets {
 function Get-LatestOsVersion {
   param([string]$ProductSlug,[int]$CadenceDays)
   $url = "https://endoflife.date/api/v1/products/$ProductSlug/releases/latest"
-  $res = Invoke-RestMethod -Uri $url -Method Get
+  $res = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-RestMethod -Uri $url -Method Get }
   $release = $res.result
-  $targetVersion = if ($release.latest.name) { $release.latest.name } else { $release.name }
+  $targetVersion = "$(if ($release.latest.name) { $release.latest.name } else { $release.name })".Trim()
   # Use the date of the latest patch/hotfix release to drive cadence; fall back to major release date if missing.
   $dateSource = $release.latest.date
   if (-not $dateSource) { $dateSource = $release.releaseDate }
-  $releaseDate = [datetime]::Parse($dateSource)
+
+  # Validate before anything is derived from it - this value ends up in Intune policies.
+  if ($targetVersion -notmatch '^\d{1,3}(\.\d{1,4}){0,3}$') {
+    throw "endoflife.date returned an unusable version for '$ProductSlug': '$targetVersion'"
+  }
+  if (-not $dateSource) {
+    throw "endoflife.date returned no release date for '$ProductSlug' $targetVersion"
+  }
+  $releaseDate = if ($dateSource -is [datetime]) { $dateSource } else { [datetime]::Parse("$dateSource", [System.Globalization.CultureInfo]::InvariantCulture) }
+  if ($releaseDate -gt (Get-Date).AddDays(1)) {
+    throw "endoflife.date returned a release date in the future for '$ProductSlug' $targetVersion ($releaseDate)"
+  }
   $effectiveDate = $releaseDate.AddDays($CadenceDays)
   return [pscustomobject]@{
     Version       = $targetVersion
@@ -471,22 +606,32 @@ function Update-CompliancePolicy {
   param([string]$Token,[string]$PolicyId,[string]$RequiredTargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,[datetime]$RequiredEffectiveDate)
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies/$PolicyId"
-  $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
-  $name = $policy.displayName
-  $current = $policy.osMinimumVersion
+  $name = $PolicyId
+  $current = $null
+  $row = { param($Action,$ErrorText) [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action=$Action;Error=$ErrorText;RequiredEffectiveDate=$RequiredEffectiveDate} }
 
-  if (-not $RequiredTargetVersion) {
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="NotEffectiveYet";RequiredEffectiveDate=$RequiredEffectiveDate}
-  }
-
-  $osUpToDate = $current -and ([version]$current -ge [version]$RequiredTargetVersion)
-  if (-not $AllowDowngrade -and $osUpToDate) {
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped";RequiredEffectiveDate=$RequiredEffectiveDate}
-  }
-  if ($DryRun) {
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate";RequiredEffectiveDate=$RequiredEffectiveDate}
-  }
+  # Everything - including the GET - is inside try, so one broken policy (deleted, wrong ID,
+  # no permission) becomes an "Error" row instead of aborting the whole run.
   try {
+    $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
+    if ($policy.displayName) { $name = $policy.displayName }
+    $current = $policy.osMinimumVersion
+
+    # Never write into a policy of another platform (e.g. a Windows policy ID entered under
+    # iOS by mistake) - its minimum version would be overwritten with an Apple version.
+    $expectedType = $CompliancePolicyTypes[$Platform]
+    if ($policy.'@odata.type' -ne $expectedType) {
+      return (& $row "Error" "Policy type '$($policy.'@odata.type')' does not match platform $Platform (expected '$expectedType') - not touched. Check the policy ID in `$CompliancePolicies.")
+    }
+
+    if (-not $RequiredTargetVersion) { return (& $row "NotEffectiveYet" $null) }
+
+    $cmp = if ($current) { Compare-OsVersion $current $RequiredTargetVersion } else { -1 }
+    if ($null -eq $cmp) { return (& $row "Error" "Cannot compare current value '$current' with target '$RequiredTargetVersion'.") }
+    # Equal: nothing to do. Higher: only lowered with $AllowDowngrade.
+    if ($cmp -eq 0 -or ($cmp -gt 0 -and -not $AllowDowngrade)) { return (& $row "Skipped" $null) }
+    if ($DryRun) { return (& $row "WouldUpdate" $null) }
+
     $body = @{
       "@odata.type"      = $policy.'@odata.type'
       "osMinimumVersion" = "$RequiredTargetVersion"
@@ -494,13 +639,10 @@ function Update-CompliancePolicy {
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Updated";RequiredEffectiveDate=$RequiredEffectiveDate}
+    return (& $row "Updated" $null)
   }
   catch {
-    $errMsg = $_.Exception.Message
-    if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
-    elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg;RequiredEffectiveDate=$RequiredEffectiveDate}
+    return (& $row "Error" (Get-ErrorText $_))
   }
 }
 
@@ -518,76 +660,115 @@ function Update-AppProtectionPolicy {
   )
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceAppManagement/iosManagedAppProtections/$PolicyId"
-  $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
-  $name = $policy.displayName
-  $current = $policy.minimumRequiredOsVersion
-  $currentWarning = $policy.minimumWarningOsVersion
-
-  # Only touch whichever field(s) are already configured on the policy. This avoids silently
-  # turning on "Block" (minimumRequiredOsVersion) on a policy that was only ever configured with
-  # "Warn" (minimumWarningOsVersion), or vice versa - the admin's chosen conditional-launch action
-  # is preserved, only the version number is kept current.
-  $hasRequired = [bool]$current
-  $hasWarning  = [bool]$currentWarning
-
   $displayTarget = if ($RequiredTargetVersion) { $RequiredTargetVersion } elseif ($WarningTargetVersion) { $WarningTargetVersion } else { $null }
-  $baseRow = @{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$displayTarget;ReleaseDate=$ReleaseDate;WarningEffectiveDate=$WarningEffectiveDate;RequiredEffectiveDate=$RequiredEffectiveDate}
+  $baseRow = @{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$PolicyId;CurrentRequired=$null;CurrentWarning=$null;Target=$displayTarget;ReleaseDate=$ReleaseDate;WarningEffectiveDate=$WarningEffectiveDate;RequiredEffectiveDate=$RequiredEffectiveDate}
 
-  if (-not $hasRequired -and -not $hasWarning) {
-    return [pscustomobject]($baseRow + @{Action="NoData"})
-  }
-
-  $requiredUpToDate = -not $hasRequired -or -not $RequiredTargetVersion -or ([version]$current -ge [version]$RequiredTargetVersion)
-  $warningUpToDate  = -not $hasWarning -or -not $WarningTargetVersion -or ([version]$currentWarning -ge [version]$WarningTargetVersion)
-
-  $willUpdateRequired = $hasRequired -and $RequiredTargetVersion -and ($AllowDowngrade -or -not $requiredUpToDate)
-  $willUpdateWarning  = $hasWarning  -and $WarningTargetVersion  -and ($AllowDowngrade -or -not $warningUpToDate)
-
-  if (-not $willUpdateRequired -and -not $willUpdateWarning) {
-    $pendingCadence = ($hasRequired -and -not $RequiredTargetVersion) -or ($hasWarning -and -not $WarningTargetVersion)
-    $action = if ($pendingCadence) { "NotEffectiveYet" } else { "Skipped" }
-    return [pscustomobject]($baseRow + @{Action=$action})
-  }
-
-  $partial = $willUpdateRequired -ne $willUpdateWarning  # exactly one of the two fields is due, the other isn't yet
-  $partialNote = if ($partial) {
-    if ($willUpdateWarning) { " (nur Warn - Block noch nicht faellig)" } else { " (nur Block - Warn bereits aktuell/nicht konfiguriert)" }
-  } else { "" }
-
-  if ($DryRun) {
-    return [pscustomobject]($baseRow + @{Action="WouldUpdate$partialNote"})
-  }
-
+  # Everything - including the GET - is inside try, so one broken policy becomes an "Error"
+  # row instead of aborting the whole run.
   try {
+    $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
+    $current = $policy.minimumRequiredOsVersion
+    $currentWarning = $policy.minimumWarningOsVersion
+    if ($policy.displayName) { $baseRow.Name = $policy.displayName }
+    $baseRow.CurrentRequired = $current
+    $baseRow.CurrentWarning  = $currentWarning
+
+    # Only touch whichever field(s) are already configured on the policy. This avoids silently
+    # turning on "Block" (minimumRequiredOsVersion) on a policy that was only ever configured with
+    # "Warn" (minimumWarningOsVersion), or vice versa - the admin's chosen conditional-launch action
+    # is preserved, only the version number is kept current.
+    $hasRequired = [bool]$current
+    $hasWarning  = [bool]$currentWarning
+
+    if (-not $hasRequired -and -not $hasWarning) {
+      return [pscustomobject]($baseRow + @{Action="NoData"})
+    }
+
+    # Per field: is it due this run (target set), and does the value need to change?
+    # Equal values never count as a change; a higher value is only lowered with $AllowDowngrade.
+    $fieldPlan = foreach ($f in @(
+        @{ Key = "Required"; Has = $hasRequired; Current = $current;        Target = $RequiredTargetVersion },
+        @{ Key = "Warning";  Has = $hasWarning;  Current = $currentWarning; Target = $WarningTargetVersion })) {
+      $cmp = if ($f.Has -and $f.Target) { Compare-OsVersion $f.Current $f.Target } else { $null }
+      if ($f.Has -and $f.Target -and $null -eq $cmp) {
+        throw "Cannot compare current $($f.Key) value '$($f.Current)' with target '$($f.Target)'."
+      }
+      [pscustomobject]@{
+        Key     = $f.Key
+        Has     = $f.Has
+        Pending = $f.Has -and -not $f.Target
+        Update  = $f.Has -and $f.Target -and ($cmp -lt 0 -or ($cmp -gt 0 -and $AllowDowngrade))
+      }
+    }
+    $req  = $fieldPlan | Where-Object Key -eq "Required"
+    $warn = $fieldPlan | Where-Object Key -eq "Warning"
+
+    if (-not $req.Update -and -not $warn.Update) {
+      $action = if ($req.Pending -or $warn.Pending) { "NotEffectiveYet" } else { "Skipped" }
+      return [pscustomobject]($baseRow + @{Action=$action})
+    }
+
+    # Exactly one field changes: say why the other one doesn't.
+    $partialNote = ""
+    if ($req.Update -ne $warn.Update) {
+      $other = if ($req.Update) { $warn } else { $req }
+      $reason = if (-not $other.Has) { "nicht konfiguriert" } elseif ($other.Pending) { "noch nicht faellig" } else { "bereits aktuell" }
+      $partialNote = if ($req.Update) { " (nur Block - Warn $reason)" } else { " (nur Warn - Block $reason)" }
+    }
+
+    if ($DryRun) {
+      return [pscustomobject]($baseRow + @{Action="WouldUpdate$partialNote"})
+    }
+
     $body = @{}
-    if ($willUpdateRequired) { $body["minimumRequiredOsVersion"] = $RequiredTargetVersion }
-    if ($willUpdateWarning)  { $body["minimumWarningOsVersion"]  = $WarningTargetVersion }
+    if ($req.Update)  { $body["minimumRequiredOsVersion"] = $RequiredTargetVersion }
+    if ($warn.Update) { $body["minimumWarningOsVersion"]  = $WarningTargetVersion }
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
     return [pscustomobject]($baseRow + @{Action="Updated$partialNote"})
   }
   catch {
-    $errMsg = $_.Exception.Message
-    if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
-    elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]($baseRow + @{Action="Error";Error=$errMsg})
+    return [pscustomobject]($baseRow + @{Action="Error";Error=(Get-ErrorText $_)})
   }
 }
 
 # --------------------------- Device-Level Compliance Check Helpers ---------------------------
 function Convert-ToComparableVersion {
   # Normalizes OS version strings so they can be cast to [version] for comparison.
-  # Handles things [version] can't: iOS RapidSecurityResponse suffixes (e.g. "26.5.2.a"),
-  # or any non-numeric trailing characters, by stripping everything except digits and dots
-  # and keeping at most 4 numeric segments (Major.Minor.Build.Revision).
+  # Takes the FIRST run of dot-separated numbers and ignores everything after it, e.g.
+  #   "26.5.2.a"      -> 26.5.2.0  (iOS Rapid Security Response suffix)
+  #   "14.1 (23B74)"  -> 14.1.0.0  (macOS build in brackets - must not be glued onto the version)
+  #   "iOS 17.4"      -> 17.4.0.0
+  #   "18.0-beta1"    -> 18.0.0.0
+  #   "17"            -> 17.0.0.0
+  # Always pads to 4 segments, because [version]"18.5" is LESS than [version]"18.5.0" in .NET
+  # (missing segments count as -1). Returns $null if no number is found.
   param([string]$VersionString)
   if (-not $VersionString) { return $null }
-  $clean = ($VersionString -replace '[^\d\.]', '')
-  $parts = @($clean.Split('.') | Where-Object { $_ -ne '' } | Select-Object -First 4)
-  if ($parts.Count -eq 0) { return $null }
-  if ($parts.Count -eq 1) { $parts += '0' }
+  if ($VersionString -notmatch '\d+(\.\d+){0,3}') { return $null }
+  $parts = @($Matches[0].Split('.'))
+  while ($parts.Count -lt 4) { $parts += '0' }
   return ($parts -join '.')
+}
+
+function Compare-OsVersion {
+  # Compares two OS version strings after normalization. Returns -1, 0 or 1 like CompareTo,
+  # or $null if either side can't be parsed.
+  param([string]$A,[string]$B)
+  $na = Convert-ToComparableVersion $A
+  $nb = Convert-ToComparableVersion $B
+  if (-not $na -or -not $nb) { return $null }
+  try { return ([version]$na).CompareTo([version]$nb) } catch { return $null }
+}
+
+function Get-VersionComplianceState {
+  # "Yes" if $Installed >= $Required, "No" if lower, "Unknown" if either can't be read.
+  param([string]$Installed,[string]$Required)
+  if (-not $Installed) { return "Unknown" }
+  $cmp = Compare-OsVersion $Installed $Required
+  if ($null -eq $cmp) { return "Unknown (version format)" }
+  if ($cmp -ge 0) { return "Yes" } else { return "No" }
 }
 
 function Get-PropertyValueLike {
@@ -643,29 +824,34 @@ function Invoke-IntuneReportExport {
     throw "Report export '$ReportName' did not complete in time (last status: $($job.status))"
   }
 
-  $tempZip = [System.IO.Path]::GetTempFileName() + ".zip"
-  Invoke-WebRequest -Uri $job.url -OutFile $tempZip -UseBasicParsing
+  # The export contains user and device data of the whole tenant - the temp files are removed
+  # in "finally", so they don't stay behind when download, extraction or parsing fails.
+  $tempBase = Join-Path ([System.IO.Path]::GetTempPath()) "IntuneReport_$([guid]::NewGuid())"
+  $tempZip = "$tempBase.zip"
+  $tempExtractDir = $tempBase
+  try {
+    Invoke-WebRequest -Uri $job.url -OutFile $tempZip -UseBasicParsing
+    New-Item -Path $tempExtractDir -ItemType Directory -Force | Out-Null
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $tempExtractDir)
 
-  $tempExtractDir = Join-Path ([System.IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString())
-  New-Item -Path $tempExtractDir -ItemType Directory -Force | Out-Null
-  Add-Type -AssemblyName System.IO.Compression.FileSystem
-  [System.IO.Compression.ZipFile]::ExtractToDirectory($tempZip, $tempExtractDir)
-
-  # If the archive contains more than one JSON file (e.g. a small metadata file alongside the
-  # actual data payload), the largest one is almost certainly the real per-row data.
-  $jsonFiles = @(Get-ChildItem -Path $tempExtractDir -Filter "*.json" -Recurse | Sort-Object Length -Descending)
-  if ($jsonFiles.Count -gt 1) {
-    Write-Log "Export archive for '$ReportName' contains $($jsonFiles.Count) JSON files: $(($jsonFiles | ForEach-Object { "$($_.Name) ($($_.Length) bytes)" }) -join '; ') - using the largest." "INFO"
+    # If the archive contains more than one JSON file (e.g. a small metadata file alongside the
+    # actual data payload), the largest one is almost certainly the real per-row data.
+    $jsonFiles = @(Get-ChildItem -Path $tempExtractDir -Filter "*.json" -Recurse | Sort-Object Length -Descending)
+    if ($jsonFiles.Count -gt 1) {
+      Write-Log "Export archive for '$ReportName' contains $($jsonFiles.Count) JSON files: $(($jsonFiles | ForEach-Object { "$($_.Name) ($($_.Length) bytes)" }) -join '; ') - using the largest." "INFO"
+    }
+    $jsonFile = $jsonFiles | Select-Object -First 1
+    if (-not $jsonFile) {
+      throw "No JSON file found in the exported '$ReportName' report archive."
+    }
+    $content = Get-Content -Path $jsonFile.FullName -Raw -Encoding UTF8
+    $data = $content | ConvertFrom-Json
   }
-  $jsonFile = $jsonFiles | Select-Object -First 1
-  if (-not $jsonFile) {
-    throw "No JSON file found in the exported '$ReportName' report archive."
+  finally {
+    Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $tempExtractDir -Recurse -Force -ErrorAction SilentlyContinue
   }
-  $content = Get-Content -Path $jsonFile.FullName -Raw -Encoding UTF8
-  $data = $content | ConvertFrom-Json
-
-  Remove-Item -Path $tempZip -Force -ErrorAction SilentlyContinue
-  Remove-Item -Path $tempExtractDir -Recurse -Force -ErrorAction SilentlyContinue
 
   # Intune report exports commonly return a tabular "columns"/"values" structure rather than an
   # array of named objects - transform it into pscustomobjects so downstream code (which looks
@@ -688,15 +874,16 @@ function Invoke-IntuneReportExport {
         return @($data.values)
       }
     }
-    $rows = @()
-    foreach ($valueRow in @($data.values)) {
+    # foreach-assignment instead of "+=" - the report can have tens of thousands of rows, and
+    # "+=" copies the whole array on every row.
+    $rows = foreach ($valueRow in @($data.values)) {
       $obj = [ordered]@{}
       for ($i = 0; $i -lt $columnNames.Count -and $i -lt $valueRow.Count; $i++) {
         $obj[$columnNames[$i]] = $valueRow[$i]
       }
-      $rows += [pscustomobject]$obj
+      [pscustomobject]$obj
     }
-    return $rows
+    return @($rows)
   }
 
   return $data
@@ -704,18 +891,41 @@ function Invoke-IntuneReportExport {
 
 $script:MamReportCache = $null
 $script:MamReportError = $null
+$script:ManagedDeviceCache = @{}
+
+function Resolve-AppProtectionDeviceRule {
+  # Decides which App Protection rule applies to one device, given the policy's Block
+  # (minimumRequiredOsVersion) and Warn (minimumWarningOsVersion) values - either may be empty.
+  # Block is checked first (stricter consequence). A device that passes Block but is below
+  # Warn is reported against the Warn rule - e.g. Block=18.3, Warn=18.5, device on 18.4: the
+  # app already shows the warning, so the device must show up as "No" for the Warn rule.
+  param([string]$Installed,[string]$BlockVersion,[string]$WarnVersion)
+  if ($BlockVersion) {
+    $state = Get-VersionComplianceState $Installed $BlockVersion
+    if ($state -ne "Yes" -or -not $WarnVersion) {
+      return [pscustomobject]@{ RuleType = "AppProtection-Block"; RequiredVersion = $BlockVersion; Compliant = $state }
+    }
+  }
+  $state = Get-VersionComplianceState $Installed $WarnVersion
+  return [pscustomobject]@{ RuleType = "AppProtection-Warn"; RequiredVersion = $WarnVersion; Compliant = $state }
+}
 
 function Get-AppProtectionDeviceRows {
   # Returns device/user rows for a given platform from the (tenant-wide, non-policy-specific)
-  # MAMAppProtectionStatus report, compared against $RequiredVersion. The report is fetched
-  # once and cached for the rest of the script run, since it isn't policy-specific anyway.
-  param([string]$Token,[string]$Platform,[string]$RequiredVersion,[string]$PolicyName,[string]$RuleType,[string]$PolicyId)
+  # MAMAppProtectionStatus report, compared against the policy's Block and Warn versions. The
+  # report is fetched once and cached for the rest of the script run, since it isn't
+  # policy-specific anyway.
+  param([string]$Token,[string]$Platform,[string]$BlockVersion,[string]$WarnVersion,[string]$PolicyName,[string]$PolicyId)
 
+  $RuleType = if ($BlockVersion) { "AppProtection-Block" } elseif ($WarnVersion) { "AppProtection-Warn" } else { "AppProtection" }
+  $RequiredVersion = if ($BlockVersion) { $BlockVersion } else { $WarnVersion }
   if (-not $RequiredVersion) {
     return @([pscustomobject]@{Platform=$Platform;PolicyType="AppProtection";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(n/a)";UserPrincipalName="(n/a)";InstalledVersion="(n/a)";RequiredVersion="(none)";Compliant="NoData";LastSync=$null;DeviceModel=$null})
   }
 
-  if (-not $script:MamReportCache -and -not $script:MamReportError) {
+  # $null check instead of "-not": an empty report (@()) is falsy and would otherwise be
+  # exported again for every App Protection policy.
+  if ($null -eq $script:MamReportCache -and -not $script:MamReportError) {
     try {
       $script:MamReportCache = @(Invoke-IntuneReportExport -Token $Token -ReportName "MAMAppProtectionStatus")
       Write-Log "MAMAppProtectionStatus report returned $($script:MamReportCache.Count) total row(s)" "INFO"
@@ -760,43 +970,31 @@ function Get-AppProtectionDeviceRows {
     return @([pscustomobject]@{Platform=$Platform;PolicyType="AppProtection";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(none reported)";UserPrincipalName="(n/a)";InstalledVersion="(n/a)";RequiredVersion=$RequiredVersion;Compliant="NoData";LastSync=$null;DeviceModel=$null})
   }
 
-  $rows = @()
-  foreach ($r in $policyRows) {
+  $rows = foreach ($r in $policyRows) {
     $deviceName = Get-PropertyValueLike -Object $r -Keywords @("DeviceName","Device Name")
     $upn = Get-PropertyValueLike -Object $r -Keywords @("UserPrincipalName","UserEmail","Email","UserName","User")
     $installedVersion = Get-PropertyValueLike -Object $r -Keywords @("PlatformVersion","OSVersion","Platform Version")
     $lastSync = Get-PropertyValueLike -Object $r -Keywords @("LastSync","Last Sync")
     $deviceModel = Get-PropertyValueLike -Object $r -Keywords @("DeviceModel","Device Model")
 
-    $compliant = "Unknown"
-    if ($installedVersion) {
-      $installedComparable = Convert-ToComparableVersion $installedVersion
-      $requiredComparable  = Convert-ToComparableVersion $RequiredVersion
-      if ($installedComparable -and $requiredComparable) {
-        try {
-          $compliant = if ([version]$installedComparable -ge [version]$requiredComparable) { "Yes" } else { "No" }
-        } catch {
-          $compliant = "Unknown (version format)"
-        }
-      }
-    }
+    $rule = Resolve-AppProtectionDeviceRule -Installed $installedVersion -BlockVersion $BlockVersion -WarnVersion $WarnVersion
 
-    $rows += [pscustomobject]@{
+    [pscustomobject]@{
       Platform          = $Platform
       PolicyType        = "AppProtection"
-      RuleType          = $RuleType
+      RuleType          = $rule.RuleType
       PolicyId          = $PolicyId
       PolicyName        = $PolicyName
       DeviceName        = $deviceName
       UserPrincipalName = $upn
       InstalledVersion  = $installedVersion
-      RequiredVersion   = $RequiredVersion
-      Compliant         = $compliant
+      RequiredVersion   = $rule.RequiredVersion
+      Compliant         = $rule.Compliant
       LastSync          = $lastSync
       DeviceModel       = $deviceModel
     }
   }
-  return $rows
+  return @($rows)
 }
 
 function Get-DeviceComplianceStatusList {
@@ -813,7 +1011,6 @@ function Get-DeviceComplianceStatusList {
   # no equivalent reliable synchronous per-policy device-status endpoint for those.
   param([string]$Token,[string]$PolicyId,[string]$PolicyName,[string]$RuleType,[string]$Platform,[string]$RequiredVersion)
   $headers = @{Authorization = "Bearer $Token"}
-  $rows = @()
 
   if (-not $RequiredVersion) {
     return @([pscustomobject]@{Platform=$Platform;PolicyType="Compliance";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(n/a)";UserPrincipalName="(n/a)";InstalledVersion="(n/a)";RequiredVersion="(none)";Compliant="NoData";LastSync=$null;DeviceModel=$null})
@@ -821,50 +1018,50 @@ function Get-DeviceComplianceStatusList {
 
   try {
     $uri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies/$PolicyId/deviceStatuses"
-    $statusResponse = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
+    $statusList = @(Invoke-GraphGetAll -Uri $uri -Headers $headers)
   } catch {
-    return @([pscustomobject]@{Platform=$Platform;PolicyType="Compliance";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(unavailable)";UserPrincipalName="(unavailable)";InstalledVersion="(unavailable)";RequiredVersion=$RequiredVersion;Compliant="Error: device-level status not available for this policy via Graph in this tenant";LastSync=$null;DeviceModel=$null})
+    $errMsg = $_.Exception.Message
+    Write-Log "Could not read device statuses of compliance policy '$PolicyName': $errMsg" "ERROR"
+    return @([pscustomobject]@{Platform=$Platform;PolicyType="Compliance";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(unavailable)";UserPrincipalName="(unavailable)";InstalledVersion="(unavailable)";RequiredVersion=$RequiredVersion;Compliant="Error: device statuses not available - $errMsg";LastSync=$null;DeviceModel=$null})
   }
 
-  $statusList = @($statusResponse.value)
   if ($statusList.Count -eq 0) {
     return @([pscustomobject]@{Platform=$Platform;PolicyType="Compliance";RuleType=$RuleType;PolicyId=$PolicyId;PolicyName=$PolicyName;DeviceName="(none assigned/reporting)";UserPrincipalName="(n/a)";InstalledVersion="(n/a)";RequiredVersion=$RequiredVersion;Compliant="NoData";LastSync=$null;DeviceModel=$null})
   }
+  Write-Log "Compliance policy '$PolicyName': $($statusList.Count) device status(es)" "INFO"
 
-  foreach ($status in $statusList) {
+  $lookupFailures = 0
+  $rows = foreach ($status in $statusList) {
     $deviceName = $status.deviceDisplayName
     $upn = if ($status.userPrincipalName) { $status.userPrincipalName } elseif ($status.userName) { $status.userName } else { $null }
     $installedVersion = $null
     $lastSync = $status.lastReportedDateTime
     $deviceModel = $null
+    $lookupFailed = $false
 
     if ($status.id) {
-      try {
-        $device = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
-          Invoke-GraphGet -Uri "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($status.id)" -Headers $headers
+      # Cached per run: the same device is often evaluated by several policies.
+      $device = $script:ManagedDeviceCache[$status.id]
+      if (-not $device) {
+        try {
+          $deviceUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($status.id)?`$select=id,osVersion,model,lastSyncDateTime"
+          $device = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $deviceUri -Headers $headers }
+          $script:ManagedDeviceCache[$status.id] = $device
+        } catch {
+          $lookupFailed = $true
+          $lookupFailures++
         }
+      }
+      if ($device) {
         $installedVersion = $device.osVersion
         $deviceModel = $device.model
         if (-not $lastSync -and $device.lastSyncDateTime) { $lastSync = $device.lastSyncDateTime }
-      } catch {
-        $installedVersion = $null
       }
     }
 
-    $compliant = "Unknown"
-    if ($installedVersion) {
-      $installedComparable = Convert-ToComparableVersion $installedVersion
-      $requiredComparable  = Convert-ToComparableVersion $RequiredVersion
-      if ($installedComparable -and $requiredComparable) {
-        try {
-          $compliant = if ([version]$installedComparable -ge [version]$requiredComparable) { "Yes" } else { "No" }
-        } catch {
-          $compliant = "Unknown (version format)"
-        }
-      }
-    }
+    $compliant = if ($lookupFailed) { "Unknown (device lookup failed)" } else { Get-VersionComplianceState $installedVersion $RequiredVersion }
 
-    $rows += [pscustomobject]@{
+    [pscustomobject]@{
       Platform          = $Platform
       PolicyType        = "Compliance"
       RuleType          = $RuleType
@@ -879,7 +1076,13 @@ function Get-DeviceComplianceStatusList {
       DeviceModel       = $deviceModel
     }
   }
-  return $rows
+  if ($lookupFailures -gt 0) {
+    # Not silent: if the device lookup fails for every device (e.g. the deviceStatuses ID does
+    # not match the managedDevices ID in this tenant), the report would otherwise just show
+    # "Unknown" everywhere and Block 3 would never notify anyone.
+    Write-Log "Compliance policy '$PolicyName': device lookup failed for $lookupFailures of $($statusList.Count) device(s) - shown as 'Unknown (device lookup failed)'." "WARN"
+  }
+  return @($rows)
 }
 
 # --------------------------- Email Notification Helpers ---------------------------
@@ -905,32 +1108,30 @@ function Send-DeviceComplianceNotification {
   # the intended recipient/subject is logged instead.
   param(
     [string]$Token,[string]$FromAddress,[string]$ToAddress,[string]$DisplayName,
-    [string]$DeviceName,[string]$InstalledVersion,[string]$RequiredVersion,
-    [string]$PolicyName,[string]$RuleType,[int]$CadenceDays,[int]$CadenceDaysWarning,[bool]$DryRun
+    [string]$DeviceName,[string]$Platform,[string]$InstalledVersion,[string]$RequiredVersion,
+    [string]$PolicyName,[string]$RuleType,[bool]$DryRun
   )
 
-  # Use the cadence value that actually applies to this rule type, not a single generic one -
-  # Warn and Block/Compliance can have different deadlines since the cadence split was added.
-  $relevantCadenceDays = switch ($RuleType) {
-    "AppProtection-Warn" { $CadenceDaysWarning }
-    default              { $CadenceDays }
+  # Block 2 compares devices against the version that is CURRENTLY configured in the policy,
+  # so the consequence already applies when this mail is sent. The text therefore describes
+  # the current state instead of promising a grace period.
+  $platformLabel = if ($Platform -eq "macOS") { "Mac" } elseif ($Platform -eq "iPadOS") { "iPad" } else { "iPhone/iPad" }
+  $subject = "Bitte aktualisieren Sie Ihr $platformLabel ($DeviceName)"
+  $statusText = switch ($RuleType) {
+    "AppProtection-Block" { "Deshalb ist der Zugriff auf Unternehmens-Apps auf diesem Gerät derzeit blockiert." }
+    "AppProtection-Warn"  { "Deshalb erhalten Sie beim Öffnen von Unternehmens-Apps eine Warnung. Ohne Update wird der Zugriff zu einem späteren Zeitpunkt blockiert." }
+    default               { "Deshalb gilt das Gerät derzeit als nicht konform, und der Zugriff auf Unternehmensdaten kann eingeschränkt sein." }
   }
-
-  $subject = "Bitte aktualisieren Sie Ihr iOS/iPadOS-Gerät ($DeviceName)"
-  $actionText = switch ($RuleType) {
-    "AppProtection-Block" { "der Zugriff auf Unternehmens-Apps auf diesem Gerät blockiert wird" }
-    "AppProtection-Warn"  { "Sie beim Zugriff auf Unternehmens-Apps eine Warnung erhalten" }
-    default               { "das Gerät als nicht konform (non-compliant) eingestuft wird" }
-  }
+  $updatePath = if ($Platform -eq "macOS") { "Systemeinstellungen > Allgemein > Softwareupdate" } else { "Einstellungen > Allgemein > Softwareupdate" }
 
   $body = @"
 Hallo $DisplayName,
 
 Ihr Gerät "$DeviceName" hat aktuell die Version $InstalledVersion installiert.
 Die Richtlinie "$PolicyName" verlangt mindestens Version $RequiredVersion.
+$statusText
 
-Bitte aktualisieren Sie Ihr Gerät zeitnah, möglichst innerhalb der nächsten $relevantCadenceDays Tage.
-Andernfalls kann es sein, dass $actionText.
+Bitte installieren Sie das Update so bald wie möglich ($updatePath).
 
 Mit freundlichen Grüßen
 IT-Support
@@ -941,7 +1142,6 @@ IT-Support
     return [pscustomobject]@{To=$ToAddress;Subject=$subject;Action="WouldSend"}
   }
 
-  $headers = @{Authorization = "Bearer $Token"; "Content-Type" = "application/json"}
   $mailPayload = @{
     message = @{
       subject      = $subject
@@ -952,8 +1152,14 @@ IT-Support
   } | ConvertTo-Json -Depth 6
 
   try {
-    Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
-      Invoke-RestMethod -Method Post -Uri "https://graph.microsoft.com/v1.0/users/$FromAddress/sendMail" -Headers $headers -Body $mailPayload
+    # Body as UTF-8 bytes with explicit charset: Windows PowerShell 5.1 (and PowerShell 7 before
+    # 7.4) would otherwise send a string body as ISO-8859-1 and mangle umlauts.
+    # -ThrottleOnly: sendMail is not idempotent - after a timeout the mail may already be sent,
+    # so only 429/503 (request definitely not processed) are retried.
+    $payloadBytes = [System.Text.Encoding]::UTF8.GetBytes($mailPayload)
+    $sendUri = "https://graph.microsoft.com/v1.0/users/$([uri]::EscapeDataString($FromAddress))/sendMail"
+    Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -ThrottleOnly -Script {
+      Invoke-RestMethod -Method Post -Uri $sendUri -Headers @{Authorization = "Bearer $Token"} -ContentType "application/json; charset=utf-8" -Body $payloadBytes
     }
     Write-Log "Sent notification to $ToAddress for device $DeviceName" "INFO"
     return [pscustomobject]@{To=$ToAddress;Subject=$subject;Action="Sent"}
@@ -962,6 +1168,20 @@ IT-Support
     Write-Log "Failed to send notification to $ToAddress for device $DeviceName - $errMsg" "ERROR"
     return [pscustomobject]@{To=$ToAddress;Subject=$subject;Action="Error";Error=$errMsg}
   }
+}
+
+function ConvertTo-CsvSafeRow {
+  # Device and user names are chosen by end users. A value starting with = + - @ (or tab/CR)
+  # is evaluated as a formula when the CSV is opened in Excel (e.g. a device named
+  # =HYPERLINK(...)). Such values get a leading apostrophe so Excel shows them as text.
+  param([psobject]$Row)
+  $copy = [ordered]@{}
+  foreach ($p in $Row.PSObject.Properties) {
+    $v = $p.Value
+    if ($v -is [string] -and $v -match '^[=+\-@\t\r]') { $v = "'" + $v }
+    $copy[$p.Name] = $v
+  }
+  return [pscustomobject]$copy
 }
 
 function Export-DeviceComplianceHtmlReport {
@@ -1042,6 +1262,17 @@ function filterTable() {
   }
 }
 var sortState = {};
+// Natural comparison: number runs are compared as numbers, so "18.10" sorts after "18.9" and
+// "26.1.1" after "26.1"; ISO dates sort chronologically.
+function naturalCompare(a, b) {
+  var ax = a.match(/\d+|\D+/g) || [], bx = b.match(/\d+|\D+/g) || [];
+  for (var i = 0; i < Math.min(ax.length, bx.length); i++) {
+    var an = /^\d/.test(ax[i]), bn = /^\d/.test(bx[i]);
+    var c = (an && bn) ? (parseInt(ax[i], 10) - parseInt(bx[i], 10)) : ax[i].localeCompare(bx[i]);
+    if (c !== 0) { return c; }
+  }
+  return ax.length - bx.length;
+}
 function sortTable(colIndex) {
   var table = document.getElementById("reportTable");
   var tbody = table.tBodies[0];
@@ -1050,15 +1281,7 @@ function sortTable(colIndex) {
   sortState = {};
   sortState[colIndex] = asc;
   rows.sort(function(a, b) {
-    var av = a.cells[colIndex].innerText;
-    var bv = b.cells[colIndex].innerText;
-    var an = parseFloat(av), bn = parseFloat(bv);
-    var cmp;
-    if (!isNaN(an) && !isNaN(bn) && av.trim() !== "" && bv.trim() !== "") {
-      cmp = an - bn;
-    } else {
-      cmp = av.localeCompare(bv);
-    }
+    var cmp = naturalCompare(a.cells[colIndex].innerText.trim(), b.cells[colIndex].innerText.trim());
     return asc ? cmp : -cmp;
   });
   rows.forEach(function(r) { tbody.appendChild(r); });
@@ -1096,6 +1319,7 @@ Write-Output "[MAIN] Attempting to acquire Graph API token..."
 try {
   $token = Get-GraphToken -TenantId $TenantId -ClientId $ClientId -AuthMode $AuthMode -CertThumbprint $CertThumbprint -ClientSecret $ClientSecret
   if (-not $token) { throw "Token acquisition returned empty." }
+  $script:TokenAcquiredAt = Get-Date
   Write-Output "[MAIN] Token acquired successfully"
 } catch {
   Write-Output "[MAIN][CRITICAL ERROR] Failed to acquire token!"
@@ -1122,17 +1346,36 @@ if ($RunPolicyMaintenance) {
 
     Write-Log "Platform ${platform}: compliance=$($CompliancePolicies[$platform].Count) appProtection=$(if ($platform -eq 'macOS') { 0 } else { $AppProtectionPolicies[$platform].Count })" "INFO"
 
-    $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
-    $targets = Resolve-CadenceTargets -State $versionState -Platform $platform -Latest $latest -CadenceDays $CadenceDays -CadenceDaysWarning $CadenceDaysWarning -Now $now -ForceApply $ForceApply
+    # A failure here (endoflife.date unreachable, implausible data) only skips this platform:
+    # every configured policy gets an "Error" row, and the run continues with the next
+    # platform and Blocks 2/3.
+    try {
+      $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
+      $targets = Resolve-CadenceTargets -State $versionState -Platform $platform -Latest $latest -CadenceDays $CadenceDays -CadenceDaysWarning $CadenceDaysWarning -Now $now -ForceApply $ForceApply
+    } catch {
+      $errMsg = $_.Exception.Message
+      Write-Log "Platform ${platform}: could not determine target version - no policy of this platform is changed. $errMsg" "ERROR"
+      foreach ($policyId in $CompliancePolicies[$platform]) {
+        $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$policyId;Action="Error";Error=$errMsg}
+      }
+      if ($platform -ne "macOS") {
+        foreach ($policyId in $AppProtectionPolicies[$platform]) {
+          $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;Action="Error";Error=$errMsg}
+        }
+      }
+      continue
+    }
     Save-VersionState -State $versionState -Path $VersionStateFilePath
 
     foreach ($policyId in $CompliancePolicies[$platform]) {
+      $token = Update-GraphTokenIfNeeded -CurrentToken $token
       $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -RequiredTargetVersion $targets.RequiredTarget -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $targets.ReleaseDate -RequiredEffectiveDate $targets.RequiredEffectiveDate
     }
 
     if ($platform -eq "macOS") { continue } # No App Protection support for macOS
 
     foreach ($policyId in $AppProtectionPolicies[$platform]) {
+      $token = Update-GraphTokenIfNeeded -CurrentToken $token
       $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -WarningTargetVersion $targets.WarningTarget -RequiredTargetVersion $targets.RequiredTarget -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $targets.ReleaseDate -WarningEffectiveDate $targets.WarningEffectiveDate -RequiredEffectiveDate $targets.RequiredEffectiveDate
     }
   }
@@ -1172,6 +1415,7 @@ if ($CheckDeviceCompliance) {
     }
 
     foreach ($policyId in $compliancePolicyIds) {
+      $token = Update-GraphTokenIfNeeded -CurrentToken $token
       try {
         $info = Get-CompliancePolicyInfo -Token $token -PolicyId $policyId
         $ruleVersion = $info.CurrentRequired
@@ -1183,21 +1427,15 @@ if ($CheckDeviceCompliance) {
     }
 
     foreach ($policyId in $appProtectionPolicyIds) {
+      $token = Update-GraphTokenIfNeeded -CurrentToken $token
       try {
-        $info = Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId -Platform $platform
-        # Prefer the Block ("Required") field if configured, else the Warn field.
-        if ($info.CurrentRequired) {
-          $ruleVersion = $info.CurrentRequired
-          $ruleType = "AppProtection-Block"
-        } elseif ($info.CurrentWarning) {
-          $ruleVersion = $info.CurrentWarning
-          $ruleType = "AppProtection-Warn"
-        } else {
-          $ruleVersion = $null
-          $ruleType = "AppProtection"
-        }
-        if (-not $ruleVersion -and $CompareAgainstLatestPublicVersion) { $ruleVersion = $publicLatestVersion }
-        $deviceResults += Get-AppProtectionDeviceRows -Token $token -Platform $platform -RequiredVersion $ruleVersion -PolicyName $info.Name -RuleType $ruleType -PolicyId $policyId
+        $info = Get-AppProtectionPolicyInfo -Token $token -PolicyId $policyId
+        # Both rules are evaluated per device (see Resolve-AppProtectionDeviceRule): a device can
+        # pass Block and still be below Warn.
+        $blockVersion = $info.CurrentRequired
+        $warnVersion  = $info.CurrentWarning
+        if (-not $blockVersion -and -not $warnVersion -and $CompareAgainstLatestPublicVersion) { $blockVersion = $publicLatestVersion }
+        $deviceResults += Get-AppProtectionDeviceRows -Token $token -Platform $platform -BlockVersion $blockVersion -WarnVersion $warnVersion -PolicyName $info.Name -PolicyId $policyId
       } catch {
         $deviceResults += [pscustomobject]@{Platform=$platform;PolicyType="AppProtection";RuleType="AppProtection";PolicyId=$policyId;PolicyName=$policyId;DeviceName="(error)";UserPrincipalName="(error)";InstalledVersion="(error)";RequiredVersion="(error)";Compliant="Error: $($_.Exception.Message)";LastSync=$null;DeviceModel=$null}
       }
@@ -1222,7 +1460,7 @@ if ($CheckDeviceCompliance) {
     $timestamp = Get-Date -Format "yyyy-MM-dd_HHmmss"
     $csvFile  = Join-Path $DeviceComplianceReportPath "IntuneDeviceComplianceReport_$timestamp.csv"
     $htmlFile = Join-Path $DeviceComplianceReportPath "IntuneDeviceComplianceReport_$timestamp.html"
-    $deviceResults | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
+    $deviceResults | ForEach-Object { ConvertTo-CsvSafeRow $_ } | Export-Csv -Path $csvFile -NoTypeInformation -Encoding UTF8
     Export-DeviceComplianceHtmlReport -Rows $deviceResults -Path $htmlFile
     Write-Output "[MAIN] Device compliance report saved to: $csvFile"
     Write-Output "[MAIN] Filterable HTML report saved to: $htmlFile"
@@ -1241,15 +1479,34 @@ if ($SendUserNotificationEmail) {
     Write-Log "Block 3 (User Notification Email) requires CheckDeviceCompliance to be true - no device data available, skipping." "ERROR"
   } else {
     Write-Output "[MAIN] Running Block 3 (User Notification Email)..."
-    $nonCompliant = @($deviceResults | Where-Object { $_.Compliant -eq "No" -and $_.UserPrincipalName -and $_.UserPrincipalName -notlike "(*" })
-    Write-Log "Found $($nonCompliant.Count) non-compliant device(s) with a resolvable user to notify" "INFO"
+    $nonCompliantRows = @($deviceResults | Where-Object { $_.Compliant -eq "No" -and $_.UserPrincipalName -and $_.UserPrincipalName -notlike "(*" })
+
+    # One mail per device: the App Protection report has one row per app instance, and the
+    # same device can also appear under a Compliance policy. Group by user + device and send
+    # only the most serious finding (Block/Compliance before Warn, then the highest required
+    # version).
+    $severity = @{ "AppProtection-Block" = 0; "Compliance" = 0; "AppProtection-Warn" = 1 }
+    $nonCompliant = @($nonCompliantRows |
+      Group-Object -Property { "$($_.UserPrincipalName.ToLowerInvariant())|$($_.DeviceName)" } |
+      ForEach-Object {
+        $_.Group |
+          Sort-Object -Property @{ Expression = { if ($severity.ContainsKey($_.RuleType)) { $severity[$_.RuleType] } else { 0 } } },
+                                @{ Expression = { [version](Convert-ToComparableVersion $_.RequiredVersion) }; Descending = $true } |
+          Select-Object -First 1
+      })
+    Write-Log "Found $($nonCompliantRows.Count) non-compliant row(s) = $($nonCompliant.Count) device(s) with a resolvable user to notify" "INFO"
 
     $emailResults = @()
-    foreach ($row in $nonCompliant) {
-      $userInfo = Get-UserMailAddress -Token $token -UserPrincipalName $row.UserPrincipalName
-      $emailResults += Send-DeviceComplianceNotification -Token $token -FromAddress $EmailSenderAddress -ToAddress $userInfo.Mail -DisplayName $userInfo.DisplayName `
-        -DeviceName $row.DeviceName -InstalledVersion $row.InstalledVersion -RequiredVersion $row.RequiredVersion `
-        -PolicyName $row.PolicyName -RuleType $row.RuleType -CadenceDays $CadenceDays -CadenceDaysWarning $CadenceDaysWarning -DryRun $DryRun
+    if ($nonCompliant.Count -gt $MaxNotificationsPerRun) {
+      Write-Log "Block 3: $($nonCompliant.Count) devices would be notified, more than `$MaxNotificationsPerRun = $MaxNotificationsPerRun. No email is sent this run - check the report (wrong target version?) and raise the limit deliberately if this is correct." "ERROR"
+    } else {
+      foreach ($row in $nonCompliant) {
+        $token = Update-GraphTokenIfNeeded -CurrentToken $token
+        $userInfo = Get-UserMailAddress -Token $token -UserPrincipalName $row.UserPrincipalName
+        $emailResults += Send-DeviceComplianceNotification -Token $token -FromAddress $EmailSenderAddress -ToAddress $userInfo.Mail -DisplayName $userInfo.DisplayName `
+          -DeviceName $row.DeviceName -Platform $row.Platform -InstalledVersion $row.InstalledVersion -RequiredVersion $row.RequiredVersion `
+          -PolicyName $row.PolicyName -RuleType $row.RuleType -DryRun $DryRun
+      }
     }
 
     Write-Output "[MAIN] Displaying email notification results..."
@@ -1263,4 +1520,25 @@ if ($SendUserNotificationEmail) {
   Write-Log "Block 3 (User Notification Email) skipped - SendUserNotificationEmail is false" "INFO"
 }
 
+# =========================================================================================
+# Summary and exit code
+# =========================================================================================
+# Exit code 1 if anything failed, so a scheduled task / runbook job shows the run as failed
+# instead of always "successful". The logging wrapper evaluates this exit code.
+if (-not $emailResults) { $emailResults = @() }
+$policyErrors = @($results | Where-Object { $_.Action -eq "Error" }).Count
+$deviceErrors = @($deviceResults | Where-Object { "$($_.Compliant)" -like "Error*" }).Count
+$mailErrors   = @($emailResults | Where-Object { $_.Action -eq "Error" }).Count
+$totalErrors  = $policyErrors + $deviceErrors + $mailErrors + $script:LoggedErrorCount
+
+Write-Output "========================================="
+Write-Output ("[SUMMARY] Policies: {0} (changed/would change: {1}, errors: {2}) | Device rows: {3} (non-compliant: {4}, errors: {5}) | Emails: {6} (errors: {7}) | Logged errors: {8}" -f `
+  $results.Count, @($results | Where-Object { "$($_.Action)" -like "Updated*" -or "$($_.Action)" -like "WouldUpdate*" }).Count, $policyErrors,
+  $deviceResults.Count, @($deviceResults | Where-Object { $_.Compliant -eq "No" }).Count, $deviceErrors,
+  $emailResults.Count, $mailErrors, $script:LoggedErrorCount)
+
+if ($totalErrors -gt 0) {
+  Write-Output "[MAIN] Script completed WITH ERRORS - see the log above."
+  exit 1
+}
 Write-Output "[MAIN] Script completed successfully"

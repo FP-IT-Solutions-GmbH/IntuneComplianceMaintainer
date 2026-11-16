@@ -49,8 +49,15 @@ $logFile = Join-Path $LogDirectory "IntuneComplianceMaintainer_$timestamp.log"
 try {
   # *> redirects all output streams (Output, Warning, Error, Verbose, Debug, Information) into
   # the log file, so nothing the main script writes gets silently dropped when run unattended.
-  & $ScriptPath *> $logFile
-  $exitNote = "Completed"
+  # The main script ends with "exit 1" when anything failed (policy, device or mail errors) -
+  # that is reported as "Failed" here, not only unhandled exceptions.
+  # Piped through Out-File -Encoding UTF8 instead of "*> file": in Windows PowerShell 5.1 the
+  # redirection operator writes UTF-16, and the summary line appended below in UTF-8 would
+  # leave a file with mixed encodings.
+  $global:LASTEXITCODE = 0
+  # Out-String -Stream renders tables (Format-Table) and records the same way the console does.
+  & $ScriptPath *>&1 | Out-String -Stream -Width 300 | Out-File -FilePath $logFile -Encoding UTF8
+  $exitNote = if ($LASTEXITCODE -ne 0) { "Failed" } else { "Completed" }
 }
 catch {
   "UNHANDLED EXCEPTION: $($_.Exception.Message)`n$($_.ScriptStackTrace)" | Out-File -FilePath $logFile -Append -Encoding UTF8

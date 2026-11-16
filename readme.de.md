@@ -44,7 +44,9 @@ New-ApplicationAccessPolicy -AppId "<client-id>" `
     -Description "Nur Automatisierungs-Postfach erlauben"
 ```
 
-Für die Zertifikats-Authentifizierung muss das Zertifikat samt privatem Schlüssel in `Cert:\CurrentUser\My` liegen — und zwar im Profil des Windows-Kontos, unter dem das Skript tatsächlich läuft (Vorsicht bei geplanten Aufgaben unter einem Dienstkonto).
+Für die Zertifikats-Authentifizierung muss das Zertifikat samt privatem Schlüssel in `Cert:\CurrentUser\My` des Kontos liegen, unter dem das Skript läuft, oder in `Cert:\LocalMachine\My` (das Skript sucht in dieser Reihenfolge in beiden). Der Computerspeicher ist die einfachste Lösung, wenn das Skript als SYSTEM läuft; das ausführende Konto braucht Lesezugriff auf den privaten Schlüssel.
+
+Für eine Managed Identity in Azure Automation vergibt `Grant-ManagedIdentityGraphPermissions.ps1` diese Rechte. `Mail.Send` und `User.Read.All` vergibt es nur mit `-IncludeMailPermissions`.
 
 ## Konfiguration
 
@@ -89,14 +91,21 @@ $VersionStateFilePath = "C:\Skripte\IntuneComplianceMaintainer-VersionState.json
 ```powershell
 $RunPolicyMaintenance = $true
 
-$CheckDeviceCompliance             = $false
+$CheckDeviceCompliance             = $true
 $CompareAgainstLatestPublicVersion = $false   # Fallback auf aktuelle öffentliche Version, falls Policy keine Mindestversion hat
-$ShowDeviceComplianceList          = $false   # Geräte-Tabelle zusätzlich auf der Konsole ausgeben
+$ShowDeviceComplianceList          = $true    # Geräte-Tabelle zusätzlich auf der Konsole ausgeben
 $DeviceComplianceReportPath        = "C:\Reports"
 
 $SendUserNotificationEmail = $false           # setzt $CheckDeviceCompliance = $true voraus
 $EmailSenderAddress        = "<sender-postfach@euretenant.onmicrosoft.com>"
+$MaxNotificationsPerRun    = 50               # Sicherheitsgrenze: darüber verschickt Block 3 nichts und meldet einen Fehler
 ```
+
+### Logging und Exit-Code
+
+`$VerboseLogging = $true` zeigt alle `INFO`-Zeilen. `WARN`- und `ERROR`-Zeilen erscheinen immer, auch mit `$VerboseLogging = $false`.
+
+Am Ende gibt das Skript eine `[SUMMARY]`-Zeile aus (Richtlinien, Gerätezeilen, E-Mails, Fehler). Ist etwas fehlgeschlagen — eine Richtlinienzeile mit `Action = Error`, eine Gerätezeile mit `Compliant = Error: ...`, eine fehlgeschlagene E-Mail oder ein geloggter `ERROR` —, endet es mit **Exit-Code 1**, damit eine geplante Aufgabe oder ein Runbook-Job den Lauf als fehlgeschlagen anzeigt.
 
 ## Funktionsweise
 
@@ -115,15 +124,29 @@ Die Felder `minimumWarningOsVersion` (Warn) und `minimumRequiredOsVersion` (Bloc
 
 Compliance-Richtlinien haben nur das eine Feld `osMinimumVersion` und nutzen ausschließlich `$CadenceDays`.
 
+**Schutzmechanismen in Block 1:**
+
+- Die Daten von endoflife.date werden vor der Verwendung geprüft: Die Version muss wie eine Versionsnummer aussehen (z. B. `26.1` oder `26.1.2`), das Release-Datum darf nicht in der Zukunft liegen. Ein Sprung um mehr als eine Hauptversion gegenüber der verfolgten Version wird abgelehnt, und die Zielversion geht nie rückwärts. Schlägt die Prüfung fehl, wird keine Richtlinie dieser Plattform geändert, und die Richtlinien erhalten eine `Error`-Zeile. Ist eine neue Hauptversion tatsächlich korrekt, den Eintrag der Plattform in der Statusdatei löschen.
+- Vor dem Schreiben einer Compliance-Richtlinie wird ihr Typ geprüft (`iosCompliancePolicy` für iOS/iPadOS, `macOSCompliancePolicy` für macOS). In eine Richtlinie einer anderen Plattform, z. B. eine versehentlich eingetragene Windows-Richtlinie, wird nie geschrieben.
+- Jede Richtlinie wird für sich verarbeitet: Eine gelöschte Richtlinie, eine falsche ID oder ein fehlendes Recht ergibt eine `Error`-Zeile für diese Richtlinie, und der Lauf geht mit der nächsten Richtlinie, Plattform und Block 2/3 weiter.
+- Versionsnummern werden nach einer Normalisierung verglichen (siehe Block 2), sodass Werte wie `17` oder `26.1.0` den Vergleich nicht stören. Ein gleicher Wert ist immer `Skipped`, auch mit `$AllowDowngrade = $true`.
+- Graph-Aufrufe werden nur bei vorübergehenden Fehlern wiederholt (Netzwerk, 408, 429, 5xx), mit Beachtung von `Retry-After`. Andere Fehler wie 404 schlagen sofort fehl. Das Graph-Token wird nach 45 Minuten automatisch erneuert.
+
 ### Block 2 — Device Compliance Report
 
-- **Compliance-Richtlinien**: nutzt den dokumentierten Graph-Endpunkt `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` für die Geräteliste und korreliert jeden Eintrag über die ID mit `/deviceManagement/managedDevices/{id}` für installierte OS-Version, Gerätemodell und letzten Sync-Zeitpunkt. Diese ID-Korrelation ist ein in der Community verbreitetes, von Microsoft aber nicht explizit dokumentiertes Muster — bei Auffälligkeiten in Graph Explorer verifizieren.
-- **App-Protection-Richtlinien**: der einfache Endpunkt für den Gerätestatus pro Richtlinie ist nicht zuverlässig über alle Tenants hinweg verfügbar. Stattdessen nutzt das Skript die asynchrone **Intune-Reports-Export-API** (`/deviceManagement/reports/exportJobs`, Report `MAMAppProtectionStatus`): Export-Job anlegen, auf Fertigstellung warten, ZIP herunterladen, entpacken, auswerten. Obwohl Microsofts eigene Doku für diesen Report "keine Filter" angibt, enthält er tatsächlich eine `Policy`-Spalte mit dem Anzeigenamen der Richtlinie — darüber ordnet das Skript die Zeilen der richtigen Richtlinie zu.
-- Ausgabe: `IntuneDeviceComplianceReport_<Zeitstempel>.csv` und eine passende `.html`-Datei mit klickbaren, sortierbaren Spalten, einer Filterzeile pro Spalte, und rot markierten nicht-konformen Zeilen — komplett eigenständig (kein externes JS/CSS, funktioniert offline).
+- **Compliance-Richtlinien**: nutzt den dokumentierten Graph-Endpunkt `/deviceManagement/deviceCompliancePolicies/{id}/deviceStatuses` für die Geräteliste (alle Seiten, über `@odata.nextLink`) und korreliert jeden Eintrag über die ID mit `/deviceManagement/managedDevices/{id}` für installierte OS-Version, Gerätemodell und letzten Sync-Zeitpunkt. Diese ID-Korrelation ist ein in der Community verbreitetes, von Microsoft aber nicht explizit dokumentiertes Muster — bei Auffälligkeiten in Graph Explorer verifizieren. Schlägt die Abfrage für ein Gerät fehl, erscheint es als `Unknown (device lookup failed)`, und eine `WARN`-Zeile nennt die Anzahl.
+- **App-Protection-Richtlinien**: der einfache Endpunkt für den Gerätestatus pro Richtlinie ist nicht zuverlässig über alle Tenants hinweg verfügbar. Stattdessen nutzt das Skript die asynchrone **Intune-Reports-Export-API** (`/deviceManagement/reports/exportJobs`, Report `MAMAppProtectionStatus`): Export-Job anlegen, auf Fertigstellung warten, ZIP herunterladen, entpacken, auswerten. Obwohl Microsofts eigene Doku für diesen Report "keine Filter" angibt, enthält er tatsächlich eine `Policy`-Spalte mit dem Anzeigenamen der Richtlinie — darüber ordnet das Skript die Zeilen der richtigen Richtlinie zu. Hat eine Richtlinie Block und Warn konfiguriert, werden **beide** pro Gerät geprüft: Ein Gerät unter Block wird gegen Block gemeldet, ein Gerät, das Block erfüllt, aber unter Warn liegt, gegen Warn (`RuleType = AppProtection-Warn`).
+- **Versionsvergleich**: Verwendet wird die erste Folge von Zahlen mit Punkten in einer Versionsangabe, aufgefüllt auf vier Stellen. So wird `14.1 (23B74)` (macOS mit Build) als 14.1 gelesen, `26.5.2.a` (Rapid Security Response) als 26.5.2, und `18.5` gilt als gleich `18.5.0`.
+- Ausgabe: `IntuneDeviceComplianceReport_<Zeitstempel>.csv` und eine passende `.html`-Datei mit klickbaren, sortierbaren Spalten (Versionsnummern und Datumswerte werden richtig sortiert), einer Filterzeile pro Spalte, und rot markierten nicht-konformen Zeilen — komplett eigenständig (kein externes JS/CSS, funktioniert offline). In der CSV erhalten Werte, die mit `=`, `+`, `-` oder `@` beginnen, ein vorangestelltes `'`, damit Excel sie nicht als Formel ausführt.
 
 ### Block 3 — User Notification Email
 
-Nutzt die Geräteliste aus Block 2, filtert auf `Compliant = "No"`-Zeilen mit auflösbarem Benutzer, ermittelt für jeden Benutzer die echte primäre SMTP-Adresse über `/users/{upn}` (Fallback auf die UPN, falls die Abfrage fehlschlägt — UPN und primäre E-Mail-Adresse sind nicht immer identisch, z. B. bei einem lokalen `.local`-UPN-Suffix), und verschickt eine individuelle E-Mail pro Gerät über `/users/{sender}/sendMail`. Die im Text genannte Frist (`$CadenceDays` vs. `$CadenceDaysWarning`) passt sich automatisch der auslösenden Regel (Warn oder Block) an.
+Nutzt die Geräteliste aus Block 2, filtert auf `Compliant = "No"`-Zeilen mit auflösbarem Benutzer, ermittelt für jeden Benutzer die echte primäre SMTP-Adresse über `/users/{upn}` (Fallback auf die UPN, falls die Abfrage fehlschlägt — UPN und primäre E-Mail-Adresse sind nicht immer identisch, z. B. bei einem lokalen `.local`-UPN-Suffix), und verschickt eine individuelle E-Mail pro Gerät über `/users/{sender}/sendMail`.
+
+- **Eine E-Mail pro Gerät:** Die Zeilen werden zuerst nach Benutzer und Gerät gruppiert (der App-Protection-Report hat eine Zeile pro App, und ein Gerät kann zusätzlich unter einer Compliance-Richtlinie auftauchen). Verschickt wird der schwerwiegendste Befund: Block/Compliance vor Warn, dann die höchste geforderte Version.
+- **Inhalt:** Betreff und Update-Pfad passen zur Plattform (iPhone/iPad oder Mac). Weil Geräte mit der *aktuell* eingestellten Version verglichen werden, beschreibt die E-Mail den aktuellen Zustand (Zugriff blockiert / Warnung wird angezeigt / Gerät nicht konform) und verspricht keine Frist.
+- **Sicherheitsgrenze:** Würden mehr als `$MaxNotificationsPerRun` Geräte angeschrieben, wird gar keine E-Mail verschickt und ein `ERROR` geloggt — Schutz vor einem Massenversand durch eine falsche Zielversion.
+- `sendMail` wird nur bei 429/503 wiederholt, damit ein Timeout nicht dazu führt, dass dieselbe E-Mail zweimal verschickt wird. Die E-Mail wird als UTF-8 gesendet, damit Umlaute auch unter Windows PowerShell 5.1 richtig ankommen.
 
 ## Unbeaufsichtigter Betrieb (geplante Aufgabe)
 
@@ -135,7 +158,9 @@ Für den täglichen Lauf auf einem Windows-Server liegen zwei Hilfsskripte bei:
   ```
 - **`Invoke-IntuneComplianceMaintainerWithLogging.ps1`** — der Wrapper, den die Aufgabe tatsächlich aufruft. Er startet das Hauptskript, schreibt dessen gesamte Ausgabe nach `IntuneComplianceMaintainer_<Zeitstempel>.log` in `-LogDirectory`, löscht Logs, die älter als `-RetentionDays` sind (Standard 30), und endet mit Exit-Code 1, wenn das Hauptskript einen Fehler geworfen hat.
 
-**Betrieb als SYSTEM:** `SYSTEM` hat einen eigenen Zertifikatsspeicher. Ein Zertifikat, das unter dem eigenen Konto importiert wurde, sieht es nicht. Entweder `AppRegSecret` verwenden (am besten aus Key Vault) oder das Zertifikat in `Cert:\CurrentUser\My` des SYSTEM-Kontos importieren. Steht das Secret direkt im Skript, die Dateirechte auf Administratoren und SYSTEM beschränken — Dateien unter `C:\` sind standardmäßig für alle lokalen Benutzer lesbar.
+Der Wrapper schreibt das Log als UTF-8 und meldet einen Lauf als `Failed` (Exit-Code 1), sowohl wenn das Hauptskript einen Fehler wirft als auch wenn es mit Exit-Code 1 endet (siehe „Logging und Exit-Code“).
+
+**Betrieb als SYSTEM:** `SYSTEM` hat einen eigenen Zertifikatsspeicher. Ein Zertifikat, das unter dem eigenen Konto importiert wurde, sieht es nicht. Entweder `AppRegCert` mit dem Zertifikat in `Cert:\LocalMachine\My` verwenden oder `AppRegSecret` (am besten aus Key Vault). Steht das Secret direkt im Skript, die Dateirechte auf Administratoren und SYSTEM beschränken — Dateien unter `C:\` sind standardmäßig für alle lokalen Benutzer lesbar.
 
 ## Bekannte Einschränkungen
 
@@ -149,7 +174,9 @@ Für den täglichen Lauf auf einem Windows-Server liegen zwei Hilfsskripte bei:
 
 **"AADSTS7000215: Invalid client secret provided"** — ihr habt die Secret-**ID** (eine reine GUID) statt des Secret-**Werts** aus Entra ID → Zertifikate & Geheimnisse eingetragen. Der Wert wird nur einmal direkt nach dem Erstellen angezeigt.
 
-**Zertifikat nicht gefunden** — muss in `Cert:\CurrentUser\My` des Kontos liegen, unter dem das Skript tatsächlich läuft (nicht `Cert:\LocalMachine\My`), samt privatem Schlüssel.
+**Zertifikat nicht gefunden** — muss samt privatem Schlüssel in `Cert:\CurrentUser\My` des Kontos liegen, unter dem das Skript tatsächlich läuft, oder in `Cert:\LocalMachine\My`, und das ausführende Konto muss den privaten Schlüssel lesen dürfen.
+
+**Lauf zeigt `Failed` / Exit-Code 1** — die `[SUMMARY]`-Zeile und die `ERROR`-/`WARN`-Zeilen im Log prüfen; dort steht jede fehlgeschlagene Richtlinie, Geräteabfrage oder E-Mail.
 
 ## Änderungsprotokoll gegenüber dem Original
 
@@ -165,6 +192,7 @@ Für den täglichen Lauf auf einem Windows-Server liegen zwei Hilfsskripte bei:
 - Prioritäts-Bug bei der Eigenschaftssuche behoben, der beim Aufbau der Benachrichtigungsempfänger einen Anzeigenamen statt einer E-Mail-Adresse hätte auswählen können
 - Dauerhafte Versionsverfolgung ergänzt (`$VersionStateFilePath`): Eine überholte Zielversion wird zur Warn-Zielversion befördert statt übersprungen, sodass Warn auch bei häufigen Releases weiter vorankommt
 - `Setup-IntuneComplianceMaintainerTask.ps1` und den Logging-Wrapper `Invoke-IntuneComplianceMaintainerWithLogging.ps1` für unbeaufsichtigte tägliche Läufe ergänzt
+- Härtung nach Code-Review (2026-11): Daten von endoflife.date werden geprüft; Typ der Compliance-Richtlinie wird vor dem Schreiben geprüft; Fehler pro Richtlinie statt Abbruch des Laufs; robuster Versionsvergleich (macOS-Build-Zusatz, `18.5` = `18.5.0`, einstellige Versionen); Paging für Gerätestatus; Block und Warn werden pro Gerät ausgewertet; eine E-Mail pro Gerät mit Sicherheitsgrenze und einem Text, der zum aktuellen Zustand passt; E-Mail-Text als UTF-8; Wiederholung nur bei vorübergehenden Fehlern; Token-Erneuerung; Exit-Code 1 bei Fehlern; Zertifikat auch aus `LocalMachine\My`; temporäre Dateien des Report-Exports werden immer entfernt; Formelschutz in der CSV; minimale Rechte als Standard im Grant-Skript
 
 ## Haftungsausschluss
 
