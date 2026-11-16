@@ -481,9 +481,18 @@ function Get-VersionState {
     $raw = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
     $state = @{}
     foreach ($prop in $raw.PSObject.Properties) {
+      # Dates are stored as ISO text in local time (see Save-VersionState). Older files may
+      # contain the "\/Date(ms)\/" format, which ConvertFrom-Json turns into a UTC DateTime -
+      # converted back to local time so deadlines don't shift by the UTC offset.
+      $d = $prop.Value.TargetVersionReleaseDate
+      if ($d -is [datetime]) {
+        if ($d.Kind -eq [DateTimeKind]::Utc) { $d = $d.ToLocalTime() }
+      } else {
+        $d = [datetime]::Parse("$d", [System.Globalization.CultureInfo]::InvariantCulture)
+      }
       $state[$prop.Name] = @{
         TargetVersion            = $prop.Value.TargetVersion
-        TargetVersionReleaseDate = [datetime]$prop.Value.TargetVersionReleaseDate
+        TargetVersionReleaseDate = $d
         WarningVersion           = $prop.Value.WarningVersion
       }
     }
@@ -499,7 +508,18 @@ function Save-VersionState {
   try {
     $dir = Split-Path -Path $Path -Parent
     if ($dir -and -not (Test-Path -Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
-    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
+    # Write dates as ISO text ("2026-11-09T00:00:00"), not as DateTime objects: Windows
+    # PowerShell 5.1 would serialize them as "\/Date(ms)\/", which reads back as UTC.
+    $serializable = [ordered]@{}
+    foreach ($key in $State.Keys) {
+      $e = $State[$key]
+      $serializable[$key] = [ordered]@{
+        TargetVersion            = $e.TargetVersion
+        TargetVersionReleaseDate = ([datetime]$e.TargetVersionReleaseDate).ToString("yyyy-MM-ddTHH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+        WarningVersion           = $e.WarningVersion
+      }
+    }
+    $serializable | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
   } catch {
     Write-Log "Could not save version state file '$Path': $($_.Exception.Message)" "ERROR"
   }
