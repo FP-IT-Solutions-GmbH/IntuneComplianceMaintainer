@@ -77,6 +77,10 @@ $AppProtectionPolicies = @{ iOS = @(); iPadOS = @() }
 $AllowDowngrade = $false
 $DryRun         = $true
 $ForceApply     = $false   # bypasses cadence, applies to both Warn and Block deadlines
+
+# Remembers per platform which OS version is being tracked toward the Block deadline
+# (see "How it works"). Written on every run, even with $DryRun = $true.
+$VersionStateFilePath = "C:\Skripte\IntuneComplianceMaintainer-VersionState.json"
 ```
 
 ### Block switches
@@ -97,10 +101,14 @@ $EmailSenderAddress        = "<sender-mailbox@yourtenant.onmicrosoft.com>"
 
 ### Block 1 — Policy Maintenance
 
-For each configured platform, the script fetches the latest OS version and release date from endoflife.date, then computes two independent deadlines from that release date:
+For each configured platform, the script fetches the latest OS version and release date from endoflife.date and keeps track of it in a small state file (`$VersionStateFilePath`). The version being tracked is the **target version**; two independent deadlines are computed from its release date:
 
 - `WarningEffectiveDate = ReleaseDate + $CadenceDaysWarning`
 - `RequiredEffectiveDate = ReleaseDate + $CadenceDays`
+
+When a deadline has passed, the target version becomes due for that field (Warn or Block). If a **newer** version appears before the target's deadlines have passed, the previous target is promoted straight to the Warn target (instead of being skipped), and tracking switches to the new version for the Block countdown. Without this, frequent point releases would keep resetting the deadlines and Warn might never advance. Once the new target's own Warn deadline passes, it takes over the Warn field as well.
+
+The state file is plain bookkeeping and is written on every run, including `$DryRun = $true`; only the actual policy writes respect `$DryRun`. Deleting the file simply restarts tracking from the current latest version. When testing a copy of the script, point `$VersionStateFilePath` to a separate file so test runs don't change the state of the real one.
 
 Each App Protection policy's `minimumWarningOsVersion` (Warn) and `minimumRequiredOsVersion` (Block) fields are then evaluated **independently** against their own deadline. A policy can end up with only the Warn field updated in a given run while Block is not yet due — this is expected, and shows up as `Updated (nur Warn - Block noch nicht faellig)` (or the reverse) rather than a plain `Updated`. Only fields that are already configured on the policy are ever touched — the script never turns on Block where only Warn existed, or vice versa.
 
@@ -115,6 +123,18 @@ Compliance policies only have the single `osMinimumVersion` field and use `$Cade
 ### Block 3 — User Notification Email
 
 Reuses Block 2's device list, filters to `Compliant = "No"` rows with a resolvable user, looks up each user's real primary SMTP address via `/users/{upn}` (falls back to the UPN if the lookup fails — UPN and primary email are not always the same, e.g. with an on-prem `.local` UPN suffix), and sends one individual email per device via `/users/{sender}/sendMail`. The email's stated deadline (`$CadenceDays` vs. `$CadenceDaysWarning`) automatically matches whichever rule (Warn or Block) triggered the notification.
+
+## Running unattended (Scheduled Task)
+
+Two helper scripts are included for running the main script daily on a Windows server:
+
+- **`Setup-IntuneComplianceMaintainerTask.ps1`** — creates (or replaces) a daily Scheduled Task. By default the task runs under a specific account (you're prompted for its credentials); with `-RunAsSystem` it runs as `SYSTEM`. Run it from an elevated PowerShell:
+  ```powershell
+  .\Setup-IntuneComplianceMaintainerTask.ps1 -ScriptPath "C:\Skripte\IntuneComplianceMaintainer.ps1" -RunAsSystem -TriggerTime "05:00"
+  ```
+- **`Invoke-IntuneComplianceMaintainerWithLogging.ps1`** — the wrapper the task actually calls. It runs the main script, writes all of its output to `IntuneComplianceMaintainer_<timestamp>.log` in `-LogDirectory`, deletes logs older than `-RetentionDays` (default 30), and exits with code 1 if the main script threw.
+
+**Running as SYSTEM:** `SYSTEM` has its own certificate store. A certificate you imported under your own account is not visible to it. Use `AppRegSecret` (preferably from Key Vault), or import the certificate into the SYSTEM account's `Cert:\CurrentUser\My`. If the secret is entered directly in the script, restrict the script file's permissions to Administrators and SYSTEM — by default, files under `C:\` are readable by all local users.
 
 ## Known limitations
 
@@ -142,6 +162,8 @@ Reuses Block 2's device list, filters to `Compliant = "No"` rows with a resolvab
 - Added device-level compliance reporting (Block 2), including CSV and filterable/sortable HTML output, device model, and last-sync timestamp
 - Added per-user individual email notification for non-compliant devices (Block 3), fully `$DryRun`-safe
 - Fixed a property-lookup priority bug that could pick a display name instead of an email address when building notification recipients
+- Added persistent version tracking (`$VersionStateFilePath`): a superseded target version is promoted to the Warn target instead of being skipped, so Warn keeps advancing during periods of frequent releases
+- Added `Setup-IntuneComplianceMaintainerTask.ps1` and the logging wrapper `Invoke-IntuneComplianceMaintainerWithLogging.ps1` for unattended daily runs
 
 ## Disclaimer
 

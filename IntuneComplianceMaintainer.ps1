@@ -3,17 +3,17 @@
   Maintains Intune Compliance and App Protection minimum-OS-version settings for Apple platforms
   (iOS, iPadOS, macOS), based on endoflife.date data, and reports/notifies on device-level
   non-compliance.
- 
+
   Supported auth methods:
     - Managed Identity
     - App Registration with Certificate
     - App Registration with Secret (optionally from Key Vault)
- 
+
   Supported platforms:
     - iOS (Compliance and App Protection)
     - iPadOS (Compliance and App Protection)
     - macOS (Compliance only - App Protection is not available for macOS in Intune)
- 
+
   The script is organized into three independently switchable blocks:
     1. Policy Maintenance ($RunPolicyMaintenance)  - keeps the configured minimum OS version
        current, respecting cadence. This is the only block that writes to Intune, and only
@@ -24,14 +24,14 @@
     3. User Notification Email ($SendUserNotificationEmail) - sends one individual email per
        non-compliant device to its owner. Requires block 2's data. Never sends a real email
        while $DryRun is $true - it only logs what would be sent.
- 
+
 .NOTES
   Based on the original IntuneComplianceMaintainer by James Robinson | SkipToTheEndpoint
   (https://skiptotheendpoint.co.uk / https://stte.me/automatecompliance), with local
   modifications: Android/Windows support removed, Warn-field support added, device-level
   compliance reporting and per-user email notification added. See README for full changelog.
 #>
- 
+
 # --------------------------- Authentication ---------------------------
 # Auth mode: ManagedIdentity | AppRegCert | AppRegSecret
 $AuthMode              = "<auth-mode>"
@@ -39,26 +39,26 @@ $TenantId              = "<tenant-id>"
 $ClientId              = "<client-id-if-AppReg>"
 $CertThumbprint        = "<thumb-if-AppRegCert>"
 $ClientSecret          = "<secret-if-AppRegSecret>"
- 
+
 # Optional: clientId of user-assigned managed identity
 $UserAssignedClientId  = ""
- 
+
 # Optional Key Vault lookups (leave blank to skip)
 $KeyVaultName          = ""
 $KeyVaultSecretName    = ""
- 
+
 # --------------------------- Environment Configuration ---------------------------
 # Cadence: days after update release before enforcing.
 # - Applies to Compliance policies (single osMinimumVersion field).
 # - Applies to App Protection's "Zugriff blockieren" field (minimumRequiredOsVersion).
 $CadenceDays           = 30
- 
+
 # Separate, typically shorter cadence for App Protection's "Warnung" field
 # (minimumWarningOsVersion). Lets you warn users well before the stricter block cadence kicks
 # in, e.g. warn after 14 days, block only after 30 days. Not used for Compliance policies,
 # since those have no separate warning field.
 $CadenceDaysWarning    = 14
- 
+
 # Policy IDs to maintain (per platform). Leave an array empty to skip that platform.
 $CompliancePolicies = @{
   iOS     = @()
@@ -86,6 +86,19 @@ $ForceApply            = $false
 # version, and - once the cadence period has elapsed - updating the policy. Writes only occur
 # if this is $true AND $DryRun is $false.
 $RunPolicyMaintenance = $true
+
+# Persists which OS version is currently being tracked toward the Required/Block deadline, per
+# platform, across script runs. Without this, every run only ever looks at "the single latest
+# version right now" - if a newer version is released before an older one's own Required cadence
+# had elapsed, the older version would simply be skipped entirely, and Warning could end up
+# never firing for it. With this state file, when a newer version supersedes the one currently
+# being tracked, the previously-tracked version is immediately promoted to the Warning target
+# (rather than waiting on its own Warning cadence, which might never complete before being
+# superseded again) - so Warning keeps advancing step by step even during frequent release
+# periods, while Required keeps counting down from whichever version is currently newest.
+# This file is written to regardless of $DryRun (it's just bookkeeping of what was observed,
+# not a change to Intune) - only actual policy writes respect $DryRun.
+$VersionStateFilePath = "C:\Skripte\IntuneComplianceMaintainer-VersionState.json"
 
 # --------------------------- Block 2: Device Compliance Report ---------------------------
 # Master switch. Read-only - never writes to Intune, runs independently of $DryRun.
@@ -350,6 +363,92 @@ function Get-AppProtectionPolicyInfo {
   return [pscustomobject]@{Name=$policy.displayName;CurrentRequired=$current;CurrentWarning=$currentWarning}
 }
 
+function Get-VersionState {
+  # Loads the persisted per-platform version-tracking state. Returns an empty hashtable if the
+  # file doesn't exist yet (first run) or can't be read.
+  param([string]$Path)
+  if (-not (Test-Path -Path $Path)) { return @{} }
+  try {
+    $raw = Get-Content -Path $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $state = @{}
+    foreach ($prop in $raw.PSObject.Properties) {
+      $state[$prop.Name] = @{
+        TargetVersion            = $prop.Value.TargetVersion
+        TargetVersionReleaseDate = [datetime]$prop.Value.TargetVersionReleaseDate
+        WarningVersion           = $prop.Value.WarningVersion
+      }
+    }
+    return $state
+  } catch {
+    Write-Log "Could not read version state file '$Path' ($($_.Exception.Message)) - starting fresh." "ERROR"
+    return @{}
+  }
+}
+
+function Save-VersionState {
+  param([hashtable]$State,[string]$Path)
+  try {
+    $dir = Split-Path -Path $Path -Parent
+    if ($dir -and -not (Test-Path -Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+    $State | ConvertTo-Json -Depth 5 | Set-Content -Path $Path -Encoding UTF8
+  } catch {
+    Write-Log "Could not save version state file '$Path': $($_.Exception.Message)" "ERROR"
+  }
+}
+
+function Resolve-CadenceTargets {
+  # Decides the actual version string to enforce for Warning and for Required/Block this run
+  # (or $null if not yet effective), given the persisted tracking state and the currently
+  # latest-known OS version. Mutates $State (the caller is responsible for persisting it).
+  #
+  # Behaviour:
+  # - First time seeing this platform: start tracking the current latest version.
+  # - Same latest version as last run: keep counting down from its own release date as usual.
+  # - A NEWER version has appeared since last run: the previously-tracked version is promoted
+  #   straight to the Warning target (bypassing its own Warning cadence, which may not have had
+  #   time to elapse), and tracking resets to the new version for the ongoing Required countdown.
+  param([hashtable]$State,[string]$Platform,[psobject]$Latest,[int]$CadenceDays,[int]$CadenceDaysWarning,[datetime]$Now,[bool]$ForceApply)
+
+  $entry = $State[$Platform]
+  if (-not $entry) {
+    $entry = @{ TargetVersion = $Latest.Version; TargetVersionReleaseDate = $Latest.ReleaseDate; WarningVersion = $null }
+    $State[$Platform] = $entry
+  }
+  elseif ($entry.TargetVersion -ne $Latest.Version) {
+    Write-Log "Platform ${Platform}: newer version detected ($($entry.TargetVersion) -> $($Latest.Version)). Promoting $($entry.TargetVersion) to the Warning target." "INFO"
+    $entry.WarningVersion = $entry.TargetVersion
+    $entry.TargetVersion = $Latest.Version
+    $entry.TargetVersionReleaseDate = $Latest.ReleaseDate
+  }
+
+  $warningDeadline  = ([datetime]$entry.TargetVersionReleaseDate).AddDays($CadenceDaysWarning)
+  $requiredDeadline = ([datetime]$entry.TargetVersionReleaseDate).AddDays($CadenceDays)
+
+  $requiredTarget = if ($ForceApply -or $Now -ge $requiredDeadline) { $entry.TargetVersion } else { $null }
+
+  # Warning normally tracks the current TargetVersion once ITS OWN Warning cadence elapses. If a
+  # newer version superseded the previous one before that could happen, the previous version was
+  # promoted (see above) and is used in the meantime. But once the current TargetVersion's own
+  # Warning cadence elapses too, it takes over from the promoted value - it's newer/higher and its
+  # own time has now come; the promoted value is cleared so future runs behave normally again.
+  if ($ForceApply -or $Now -ge $warningDeadline) {
+    $warningTarget = $entry.TargetVersion
+    $entry.WarningVersion = $null
+  } elseif ($entry.WarningVersion) {
+    $warningTarget = $entry.WarningVersion
+  } else {
+    $warningTarget = $null
+  }
+
+  return [pscustomobject]@{
+    WarningTarget         = $warningTarget
+    RequiredTarget        = $requiredTarget
+    ReleaseDate            = $entry.TargetVersionReleaseDate
+    WarningEffectiveDate   = $warningDeadline
+    RequiredEffectiveDate  = $requiredDeadline
+  }
+}
+
 function Get-LatestOsVersion {
   param([string]$ProductSlug,[int]$CadenceDays)
   $url = "https://endoflife.date/api/v1/products/$ProductSlug/releases/latest"
@@ -369,47 +468,53 @@ function Get-LatestOsVersion {
 }
 
 function Update-CompliancePolicy {
-  param([string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate)
+  param([string]$Token,[string]$PolicyId,[string]$RequiredTargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,[datetime]$RequiredEffectiveDate)
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceManagement/deviceCompliancePolicies/$PolicyId"
   $policy = Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script { Invoke-GraphGet -Uri $uri -Headers $headers }
   $name = $policy.displayName
   $current = $policy.osMinimumVersion
-  $osUpToDate = $current -and ([version]$current -ge [version]$TargetVersion)
+
+  if (-not $RequiredTargetVersion) {
+    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="NotEffectiveYet";RequiredEffectiveDate=$RequiredEffectiveDate}
+  }
+
+  $osUpToDate = $current -and ([version]$current -ge [version]$RequiredTargetVersion)
   if (-not $AllowDowngrade -and $osUpToDate) {
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped"}
+    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Skipped";RequiredEffectiveDate=$RequiredEffectiveDate}
   }
   if ($DryRun) {
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate"}
+    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="WouldUpdate";RequiredEffectiveDate=$RequiredEffectiveDate}
   }
   try {
     $body = @{
       "@odata.type"      = $policy.'@odata.type'
-      "osMinimumVersion" = "$TargetVersion"
+      "osMinimumVersion" = "$RequiredTargetVersion"
     }
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Updated"}
+    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Updated";RequiredEffectiveDate=$RequiredEffectiveDate}
   }
   catch {
     $errMsg = $_.Exception.Message
     if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errMsg = $_.ErrorDetails.Message }
     elseif ($_.Exception.Response -and $_.Exception.Response.Content) { $errMsg = $_.Exception.Response.Content }
-    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$TargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg}
+    return [pscustomobject]@{Platform=$Platform;Type="Compliance";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;Target=$RequiredTargetVersion;ReleaseDate=$ReleaseDate;Action="Error";Error=$errMsg;RequiredEffectiveDate=$RequiredEffectiveDate}
   }
 }
 
 function Update-AppProtectionPolicy {
   # Evaluates the "Warn" (minimumWarningOsVersion) and "Zugriff blockieren"
-  # (minimumRequiredOsVersion) fields independently, each against its own cadence deadline.
-  # A policy can end up with only one of the two fields updated in a given run (e.g. Warn
-  # becomes due after 14 days, Required/Block only after 30 days) - this is expected, not an
-  # error. Only fields already configured on the policy are ever touched (see comment below).
+  # (minimumRequiredOsVersion) fields independently. $WarningTargetVersion and
+  # $RequiredTargetVersion are each either a version string (already decided as due by
+  # Resolve-CadenceTargets, including any Warning promotion) or $null (not yet effective this
+  # run). A policy can end up with only one of the two fields updated in a given run - this is
+  # expected, not an error. Only fields already configured on the policy are ever touched.
   param(
-    [string]$Token,[string]$PolicyId,[string]$TargetVersion,[bool]$DryRun,[bool]$AllowDowngrade,
-    [string]$Platform,[datetime]$ReleaseDate,[datetime]$WarningEffectiveDate,[datetime]$RequiredEffectiveDate,
-    [bool]$ForceApply,[datetime]$Now
+    [string]$Token,[string]$PolicyId,[string]$WarningTargetVersion,[string]$RequiredTargetVersion,
+    [bool]$DryRun,[bool]$AllowDowngrade,[string]$Platform,[datetime]$ReleaseDate,
+    [datetime]$WarningEffectiveDate,[datetime]$RequiredEffectiveDate
   )
   $headers = @{Authorization = "Bearer $Token"}
   $uri = "https://graph.microsoft.com/beta/deviceAppManagement/iosManagedAppProtections/$PolicyId"
@@ -425,23 +530,21 @@ function Update-AppProtectionPolicy {
   $hasRequired = [bool]$current
   $hasWarning  = [bool]$currentWarning
 
-  $baseRow = @{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$TargetVersion;ReleaseDate=$ReleaseDate;WarningEffectiveDate=$WarningEffectiveDate;RequiredEffectiveDate=$RequiredEffectiveDate}
+  $displayTarget = if ($RequiredTargetVersion) { $RequiredTargetVersion } elseif ($WarningTargetVersion) { $WarningTargetVersion } else { $null }
+  $baseRow = @{Platform=$Platform;Type="AppProtection";Setting="MinimumVersion";Name=$name;CurrentRequired=$current;CurrentWarning=$currentWarning;Target=$displayTarget;ReleaseDate=$ReleaseDate;WarningEffectiveDate=$WarningEffectiveDate;RequiredEffectiveDate=$RequiredEffectiveDate}
 
   if (-not $hasRequired -and -not $hasWarning) {
     return [pscustomobject]($baseRow + @{Action="NoData"})
   }
 
-  $requiredUpToDate = -not $hasRequired -or ([version]$current -ge [version]$TargetVersion)
-  $warningUpToDate  = -not $hasWarning -or ([version]$currentWarning -ge [version]$TargetVersion)
+  $requiredUpToDate = -not $hasRequired -or -not $RequiredTargetVersion -or ([version]$current -ge [version]$RequiredTargetVersion)
+  $warningUpToDate  = -not $hasWarning -or -not $WarningTargetVersion -or ([version]$currentWarning -ge [version]$WarningTargetVersion)
 
-  $requiredEligible = $ForceApply -or ($Now -ge $RequiredEffectiveDate)
-  $warningEligible  = $ForceApply -or ($Now -ge $WarningEffectiveDate)
-
-  $willUpdateRequired = $hasRequired -and $requiredEligible -and ($AllowDowngrade -or -not $requiredUpToDate)
-  $willUpdateWarning  = $hasWarning  -and $warningEligible  -and ($AllowDowngrade -or -not $warningUpToDate)
+  $willUpdateRequired = $hasRequired -and $RequiredTargetVersion -and ($AllowDowngrade -or -not $requiredUpToDate)
+  $willUpdateWarning  = $hasWarning  -and $WarningTargetVersion  -and ($AllowDowngrade -or -not $warningUpToDate)
 
   if (-not $willUpdateRequired -and -not $willUpdateWarning) {
-    $pendingCadence = ($hasRequired -and -not $requiredEligible -and -not $requiredUpToDate) -or ($hasWarning -and -not $warningEligible -and -not $warningUpToDate)
+    $pendingCadence = ($hasRequired -and -not $RequiredTargetVersion) -or ($hasWarning -and -not $WarningTargetVersion)
     $action = if ($pendingCadence) { "NotEffectiveYet" } else { "Skipped" }
     return [pscustomobject]($baseRow + @{Action=$action})
   }
@@ -457,8 +560,8 @@ function Update-AppProtectionPolicy {
 
   try {
     $body = @{}
-    if ($willUpdateRequired) { $body["minimumRequiredOsVersion"] = $TargetVersion }
-    if ($willUpdateWarning)  { $body["minimumWarningOsVersion"]  = $TargetVersion }
+    if ($willUpdateRequired) { $body["minimumRequiredOsVersion"] = $RequiredTargetVersion }
+    if ($willUpdateWarning)  { $body["minimumWarningOsVersion"]  = $WarningTargetVersion }
     Invoke-WithRetry -RetryCount $RetryCount -DelaySeconds $RetryDelaySeconds -Script {
       Invoke-RestMethod -Method Patch -Uri $uri -Headers $headers -ContentType "application/json" -Body ($body | ConvertTo-Json)
     }
@@ -1010,6 +1113,8 @@ $results = @()
 if ($RunPolicyMaintenance) {
   Write-Log "Starting Block 1 (Policy Maintenance): DryRun=$DryRun; AllowDowngrade=$AllowDowngrade; ForceApply=$ForceApply; CadenceDays=$CadenceDays; CadenceDaysWarning=$CadenceDaysWarning" "INFO"
 
+  $versionState = Get-VersionState -Path $VersionStateFilePath
+
   foreach ($platform in $EolProducts.Keys) {
     $hasCompliance  = $CompliancePolicies[$platform] -and $CompliancePolicies[$platform].Count -gt 0
     $hasAppProtect  = ($platform -ne "macOS") -and $AppProtectionPolicies[$platform] -and $AppProtectionPolicies[$platform].Count -gt 0
@@ -1017,45 +1122,18 @@ if ($RunPolicyMaintenance) {
 
     Write-Log "Platform ${platform}: compliance=$($CompliancePolicies[$platform].Count) appProtection=$(if ($platform -eq 'macOS') { 0 } else { $AppProtectionPolicies[$platform].Count })" "INFO"
 
-    $latest = $null
-    $notEffectiveCompliance = $false
-    if ($hasCompliance) {
-      $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
-      $notEffectiveCompliance = $now -lt $latest.EffectiveDate
-    }
-
-    $appLatest = $null
-    $warningEffectiveDate = $null
-    $requiredEffectiveDate = $null
-    if ($hasAppProtect) {
-      # Reuse $latest instead of a second, redundant call to the same endoflife.date endpoint.
-      $appLatest = if ($latest) { $latest } else { Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays }
-      $warningEffectiveDate  = $appLatest.ReleaseDate.AddDays($CadenceDaysWarning)
-      $requiredEffectiveDate = $appLatest.ReleaseDate.AddDays($CadenceDays)
-    }
+    $latest = Get-LatestOsVersion -ProductSlug $EolProducts[$platform] -CadenceDays $CadenceDays
+    $targets = Resolve-CadenceTargets -State $versionState -Platform $platform -Latest $latest -CadenceDays $CadenceDays -CadenceDaysWarning $CadenceDaysWarning -Now $now -ForceApply $ForceApply
+    Save-VersionState -State $versionState -Path $VersionStateFilePath
 
     foreach ($policyId in $CompliancePolicies[$platform]) {
-      if ($notEffectiveCompliance) {
-        $info = Get-CompliancePolicyInfo -Token $token -PolicyId $policyId
-        if (-not $ForceApply) {
-          $results += [pscustomobject]@{Platform=$platform;Type="Compliance";Setting="MinimumVersion";Name=$info.Name;CurrentRequired=$info.CurrentRequired;Target=$latest.Version;ReleaseDate=$latest.ReleaseDate;Action="NotEffectiveYet";EffectiveDate=$latest.EffectiveDate}
-          continue
-        }
-      }
-      $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -TargetVersion $latest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $latest.ReleaseDate
+      $results += Update-CompliancePolicy -Token $token -PolicyId $policyId -RequiredTargetVersion $targets.RequiredTarget -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $targets.ReleaseDate -RequiredEffectiveDate $targets.RequiredEffectiveDate
     }
 
     if ($platform -eq "macOS") { continue } # No App Protection support for macOS
 
     foreach ($policyId in $AppProtectionPolicies[$platform]) {
-      if (-not $appLatest -or -not $appLatest.ReleaseDate) {
-        $results += [pscustomobject]@{Platform=$platform;Type="AppProtection";Setting="MinimumVersion";Name=$policyId;CurrentRequired="(unknown)";Target="(none)";ReleaseDate=$null;Action="NoData";EffectiveDate=$null}
-        continue
-      }
-      # Update-AppProtectionPolicy evaluates the Warn and Required/Block fields against their
-      # own cadence deadlines internally, so it's always called directly - no separate
-      # "NotEffectiveYet" pre-check here (a policy might be due for Warn but not yet for Block).
-      $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -TargetVersion $appLatest.Version -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $appLatest.ReleaseDate -WarningEffectiveDate $warningEffectiveDate -RequiredEffectiveDate $requiredEffectiveDate -ForceApply $ForceApply -Now $now
+      $results += Update-AppProtectionPolicy -Token $token -PolicyId $policyId -WarningTargetVersion $targets.WarningTarget -RequiredTargetVersion $targets.RequiredTarget -DryRun $DryRun -AllowDowngrade $AllowDowngrade -Platform $platform -ReleaseDate $targets.ReleaseDate -WarningEffectiveDate $targets.WarningEffectiveDate -RequiredEffectiveDate $targets.RequiredEffectiveDate
     }
   }
 

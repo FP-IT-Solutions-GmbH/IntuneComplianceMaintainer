@@ -43,3 +43,6 @@ out/
 *.gz
 *.7z
 *.rar
+
+# Local code-review output
+Review/
